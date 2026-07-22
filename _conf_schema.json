@@ -1,0 +1,44 @@
+{
+  "enabled": {
+    "description": "启用智能续聊",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，主模型会为每轮对话判断是否安排一次主动消息。"
+  },
+  "private_only": {
+    "description": "仅在私聊中启用",
+    "type": "bool",
+    "default": true,
+    "hint": "群聊中的沉默通常不代表对话对象离开，建议保持开启。"
+  },
+  "disable_streaming": {
+    "description": "自动关闭流式回复",
+    "type": "bool",
+    "default": true,
+    "hint": "避免模型生成的隐藏调度标签在流式传输时短暂显示给用户。"
+  },
+  "min_delay_seconds": {
+    "description": "最短等待时间（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "模型给出的时间不会短于此值。"
+  },
+  "max_delay_seconds": {
+    "description": "最长等待时间（秒）",
+    "type": "int",
+    "default": 86400,
+    "hint": "模型给出的时间不会长于此值，默认 24 小时。"
+  },
+  "daily_limit": {
+    "description": "每个会话每日主动消息上限",
+    "type": "int",
+    "default": 3,
+    "hint": "设置为 0 可阻止主动消息实际发送。每次用户沉默最多只发送一条。"
+  },
+  "max_message_length": {
+    "description": "主动消息最大长度",
+    "type": "int",
+    "default": 300,
+    "hint": "超过此长度的预生成主动消息会被裁剪。"
+  }
+}
