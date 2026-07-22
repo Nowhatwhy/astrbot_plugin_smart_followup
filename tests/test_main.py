@@ -154,6 +154,8 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         event = SimpleNamespace(
             unified_msg_origin="umo",
             is_private_chat=lambda: True,
+            get_message_str=lambda: "用户消息",
+            get_message_outline=lambda: "用户消息",
             get_extra=lambda key: extras.get(key),
             set_extra=extras.__setitem__,
         )
@@ -174,6 +176,8 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         event = SimpleNamespace(
             unified_msg_origin="umo",
             is_private_chat=lambda: True,
+            get_message_str=lambda: "用户消息",
+            get_message_outline=lambda: "用户消息",
             get_extra=lambda key: None,
             set_extra=lambda key, value: None,
         )
@@ -184,6 +188,32 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
             await self.plugin.record_user_activity(event)
 
         log_info.assert_not_called()
+
+    async def test_empty_platform_event_does_not_cancel_pending_wake(self) -> None:
+        """正在输入等空平台事件不应被当作用户发送消息。"""
+        self.plugin._sessions["umo"] = {
+            "revision": 7,
+            "pending": {
+                "revision": 7,
+                "run_at": "2999-01-01T00:00:00+00:00",
+            },
+            "daily_date": "",
+            "daily_count": 0,
+        }
+        pending_task = asyncio.create_task(asyncio.sleep(3600))
+        self.plugin._tasks["umo"] = pending_task
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            get_message_str=lambda: "",
+            get_message_outline=lambda: "",
+            get_extra=lambda key: None,
+        )
+
+        await self.plugin.record_user_activity(event)
+
+        self.assertFalse(pending_task.cancelled())
+        self.assertEqual(self.plugin._sessions["umo"]["revision"], 7)
+        self.assertIsNotNone(self.plugin._sessions["umo"]["pending"])
 
     async def test_prompt_rule_is_system_and_runtime_data_is_temporary(self) -> None:
         """稳定规则应进入 system prompt，动态数据应只用于本轮。"""

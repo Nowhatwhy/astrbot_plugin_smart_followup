@@ -310,6 +310,12 @@ class SmartFollowupPlugin(Star):
             event.set_extra("enable_streaming", False)
             return
 
+        if (
+            not event.get_message_str().strip()
+            and not event.get_message_outline().strip()
+        ):
+            return
+
         if not self._is_eligible(event):
             return
 
