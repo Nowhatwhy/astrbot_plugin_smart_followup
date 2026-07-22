@@ -21,7 +21,7 @@
 ## 提示词放置
 
 - 稳定的决策规则放在 system prompt 末尾，可通过 `decision_prompt` 配置。
-- 当前时间、近期消息间隔和每日调度次数通过临时 `extra_user_content_parts` 放在本轮用户输入之后。
+- 当前本地时间通过临时 `extra_user_content_parts` 放在本轮用户输入之后。
 - 动态内容使用 `mark_as_temp()`，不会写入会话历史。
 - 到点时消息总线只接收短标记 `<<SMART_FOLLOWUP_WAKE>>`；完整 `wake_prompt` 到最终 LLM 请求阶段才作为历史末尾的临时 user 消息加入，不修改 system prompt，也不会保存到历史。
 - 不在用户提示词末尾重复完整决策协议，避免把稳定规则降级成普通用户内容。
@@ -39,7 +39,7 @@
 - 唤醒指令仅作为临时 user 消息追加，不改写 system prompt
 - 用户新消息自动取消旧任务
 - 待执行时间由插件存储持久化，插件重载或 AstrBot 重启后可恢复
-- 根据当前时间、近期活跃度和语义决定等待时间
+- 根据当前时间和对话语义决定等待时间
 - 每个会话每日主动回复上限
 - 默认只处理私聊
 - 默认关闭流式回复，防止调度标记短暂泄漏
@@ -68,11 +68,11 @@ git clone https://github.com/Nowhatwhy/astrbot_plugin_smart_followup.git
 | `daily_limit` | `3` | 每个会话每日主动回复上限 |
 | `decision_prompt` | 内置模板 | 当前轮的时间决策规则，注入 system prompt |
 | `wake_prompt` | 内置模板 | 时间到达后交给主动 Agent 的任务指令 |
-| `debug_full_payload` | `false` | 临时记录续聊提示词与模型响应 |
+| `debug_full_payload` | `false` | 启用调度过程及完整请求、响应日志 |
 
 ## 日志诊断
 
-运行日志统一以 `[smart_followup]` 开头，覆盖用户活动、旧任务取消、决策解析、本地等待任务创建、唤醒事件入队和异常。每次请求还会记录 `request_kind` 与 `system_prompt_sha256`；普通请求和唤醒请求的哈希应相同，可以直接用来确认 system prompt 未变化。`debug_full_payload` 只应在排查时开启；它会记录完整 system prompt、本轮用户消息、续聊临时数据、模型正文和思考内容，可能包含敏感信息。
+插件默认不输出日常运行日志，只保留真正的异常。开启 `debug_full_payload` 后才会记录调度过程、完整 system prompt、本轮用户消息、模型正文和思考内容，可能包含敏感信息，仅应在排查时使用。
 
 ## 版本要求
 

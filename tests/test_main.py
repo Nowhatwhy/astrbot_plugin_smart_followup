@@ -1,9 +1,8 @@
 import asyncio
-import time
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.core.platform.platform_metadata import PlatformMetadata
@@ -116,12 +115,32 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def test_initialize_removes_legacy_activity_intervals(self) -> None:
+        """初始化时应清除旧版本持久化的用户活动间隔。"""
+        self.plugin.get_kv_data = AsyncMock(
+            return_value={
+                "sessions": {
+                    "umo": {
+                        "revision": 1,
+                        "last_user_at": 123.0,
+                        "recent_intervals": [1, 2, 3],
+                        "pending": None,
+                    }
+                }
+            }
+        )
+
+        await self.plugin.initialize()
+
+        state = self.plugin._sessions["umo"]
+        self.assertNotIn("last_user_at", state)
+        self.assertNotIn("recent_intervals", state)
+        self.plugin.put_kv_data.assert_awaited()
+
     async def test_new_user_message_cancels_pending_agent_job(self) -> None:
         """新用户消息应删除旧任务并递增会话版本号。"""
         self.plugin._sessions["umo"] = {
             "revision": 7,
-            "last_user_at": time.time() - 20,
-            "recent_intervals": [],
             "pending": {
                 "revision": 7,
                 "run_at": "2999-01-01T00:00:00+00:00",
@@ -146,13 +165,30 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         state = self.plugin._sessions["umo"]
         self.assertEqual(state["revision"], 8)
         self.assertIsNone(state["pending"])
+        self.assertNotIn("last_user_at", state)
+        self.assertNotIn("recent_intervals", state)
         self.assertFalse(extras["enable_streaming"])
+
+    async def test_default_mode_does_not_log_routine_user_activity(self) -> None:
+        """关闭调试日志时，普通用户活动不应产生插件 INFO 日志。"""
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            is_private_chat=lambda: True,
+            get_extra=lambda key: None,
+            set_extra=lambda key, value: None,
+        )
+
+        with patch(
+            "data.plugins.astrbot_plugin_smart_followup.main.logger.info"
+        ) as log_info:
+            await self.plugin.record_user_activity(event)
+
+        log_info.assert_not_called()
 
     async def test_prompt_rule_is_system_and_runtime_data_is_temporary(self) -> None:
         """稳定规则应进入 system prompt，动态数据应只用于本轮。"""
         self.plugin._sessions["umo"] = {
             "revision": 2,
-            "recent_intervals": [12, 18],
             "daily_date": "",
             "daily_count": 0,
         }
@@ -171,9 +207,10 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<<SMART_FOLLOWUP|NEVER>>", request.system_prompt)
         self.assertNotIn("30", request.system_prompt)
         self.assertNotIn("3600", request.system_prompt)
-        self.assertNotIn("12s, 18s", request.system_prompt)
         self.assertEqual(len(request.extra_user_content_parts), 1)
-        self.assertIn("12s, 18s", request.extra_user_content_parts[0].text)
+        self.assertIn("当前本地时间", request.extra_user_content_parts[0].text)
+        self.assertNotIn("近期用户消息间隔", request.extra_user_content_parts[0].text)
+        self.assertNotIn("今日已安排主动回复", request.extra_user_content_parts[0].text)
         self.assertTrue(request.extra_user_content_parts[0]._no_save)
 
     async def test_delay_config_does_not_change_system_prompt(self) -> None:
@@ -200,7 +237,6 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         """唤醒请求只应在历史末尾追加不保存的临时 user 消息。"""
         self.plugin._sessions["umo"] = {
             "revision": 4,
-            "recent_intervals": [10],
             "daily_date": "",
             "daily_count": 0,
         }
@@ -236,8 +272,8 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
             DEFAULT_WAKE_PROMPT,
             [part["text"] for part in wake_request.contexts[-1]["content"]],
         )
-        self.assertIn("不要再次判断是否值得发送", DEFAULT_WAKE_PROMPT)
-        self.assertIn("生成一条非空", DEFAULT_WAKE_PROMPT)
+        self.assertIn("不要再次判断是否发送", DEFAULT_WAKE_PROMPT)
+        self.assertIn("自然、非空的主动消息", DEFAULT_WAKE_PROMPT)
 
     async def test_schedule_creates_persistent_local_wait(self) -> None:
         """回复发送后应持久化时间并创建一次本地等待任务。"""
