@@ -44,8 +44,6 @@
   "user_prompt_reminder": {
     "description": "用户提示词末尾提醒内容",
     "type": "text",
-    "editor_mode": true,
-    "editor_language": "markdown",
     "default": "硬性输出要求：只在思考中决定时间不算完成。完成回复正文后，必须在最终回答最后一行原样输出且只输出一个完整调度标记。正常联系格式例如 <<SMART_FOLLOWUP|1800>>，将 1800 替换为等待秒数；只有用户明确要求永久停止主动联系时，才允许输出完整标记 <<SMART_FOLLOWUP|NEVER>>。不得裸输出数字或 NEVER，不得只用自然语言描述时间，也不得省略标记。",
     "hint": "临时拼接到本轮用户提示词末尾，不会保存到历史。自定义时应保留完整的 SMART_FOLLOWUP 标签格式。"
   },
