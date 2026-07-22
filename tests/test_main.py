@@ -6,12 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from astrbot.api.provider import LLMResponse, ProviderRequest
-from astrbot.core.agent.message import TextPart
+from astrbot.core.agent.message import Message, TextPart
 from astrbot.core.platform.platform_metadata import PlatformMetadata
 from data.plugins.astrbot_plugin_smart_followup.main import (
     EVENT_DECISION,
     EVENT_REQUEST,
     EVENT_REVISION,
+    EVENT_SYSTEM_PROMPT,
     WAKE_EVENT,
     WAKE_PROMPT,
     SmartFollowupPlugin,
@@ -143,19 +144,33 @@ class SmartFollowupTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(task.cancelled())
         self.assertNotIn("umo", self.plugin._revisions)
 
-    async def test_injects_stable_and_temporary_prompts(self) -> None:
-        """稳定规则进入 system，动态内容只用于当前请求。"""
+    async def test_injects_temporary_user_prompt(self) -> None:
+        """动态内容只用于当前请求。"""
         self.plugin._revisions["umo"] = 1
         event = FakeEvent(extras={EVENT_REVISION: 1})
         request = ProviderRequest(system_prompt="persona", prompt="用户消息")
 
         await self.plugin.inject_prompt(event, request)
 
-        self.assertIn(self.plugin.config["decision_prompt"], request.system_prompt)
+        self.assertEqual(request.system_prompt, "persona")
         self.assertEqual(len(request.extra_user_content_parts), 1)
         self.assertIn("当前本地时间", request.extra_user_content_parts[0].text)
         self.assertTrue(request.extra_user_content_parts[0]._no_save)
         self.assertIs(event.get_extra(EVENT_REQUEST), request)
+
+    async def test_injects_and_captures_agent_system_prompt(self) -> None:
+        """稳定规则应在 Agent 开始阶段注入并供重试复用。"""
+        self.plugin._revisions["umo"] = 1
+        event = FakeEvent(extras={EVENT_REVISION: 1})
+        run_context = SimpleNamespace(
+            messages=[Message(role="system", content="persona")]
+        )
+
+        await self.plugin.inject_system_prompt(event, run_context)
+
+        system_prompt = run_context.messages[0].content
+        self.assertIn(self.plugin.config["decision_prompt"], system_prompt)
+        self.assertEqual(event.get_extra(EVENT_SYSTEM_PROMPT), system_prompt)
 
     async def test_wake_prompt_is_not_saved(self) -> None:
         """唤醒指令应成为历史末尾的不保存 user 消息。"""
@@ -219,7 +234,11 @@ class SmartFollowupTest(unittest.IsolatedAsyncioTestCase):
             session_id="session-1",
         )
         event = FakeEvent(
-            extras={EVENT_DECISION: (5, "主回复"), EVENT_REQUEST: request}
+            extras={
+                EVENT_DECISION: (5, "主回复"),
+                EVENT_REQUEST: request,
+                EVENT_SYSTEM_PROMPT: "final-system",
+            }
         )
         self.plugin.context.get_current_chat_provider_id = AsyncMock(
             return_value="provider-1"
@@ -233,9 +252,10 @@ class SmartFollowupTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin.schedule(event)
 
         call = self.plugin.context.llm_generate.await_args.kwargs
-        self.assertEqual(call["system_prompt"], "system")
+        self.assertEqual(call["system_prompt"], "final-system")
         self.assertEqual(call["prompt"], self.plugin.config["retry_prompt"])
         self.assertEqual(call["contexts"][-1]["content"], "主回复")
+        self.assertNotIn("tools", call)
         self.assertIn("umo", self.plugin._tasks)
 
     async def test_failed_retry_does_not_schedule(self) -> None:
@@ -243,7 +263,11 @@ class SmartFollowupTest(unittest.IsolatedAsyncioTestCase):
         self.plugin._revisions["umo"] = 6
         request = ProviderRequest(system_prompt="system")
         event = FakeEvent(
-            extras={EVENT_DECISION: (6, "主回复"), EVENT_REQUEST: request}
+            extras={
+                EVENT_DECISION: (6, "主回复"),
+                EVENT_REQUEST: request,
+                EVENT_SYSTEM_PROMPT: "final-system",
+            }
         )
         self.plugin.context.get_current_chat_provider_id = AsyncMock(
             return_value="provider-1"
@@ -261,7 +285,11 @@ class SmartFollowupTest(unittest.IsolatedAsyncioTestCase):
         self.plugin._revisions["umo"] = 7
         request = ProviderRequest(system_prompt="system")
         event = FakeEvent(
-            extras={EVENT_DECISION: (7, "主回复"), EVENT_REQUEST: request}
+            extras={
+                EVENT_DECISION: (7, "主回复"),
+                EVENT_REQUEST: request,
+                EVENT_SYSTEM_PROMPT: "final-system",
+            }
         )
         self.plugin.context.get_current_chat_provider_id = AsyncMock(
             return_value="provider-1"

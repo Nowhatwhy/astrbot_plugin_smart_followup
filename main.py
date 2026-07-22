@@ -7,7 +7,9 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
-from astrbot.core.agent.message import TextPart
+from astrbot.core.agent.message import Message, TextPart
+from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.platform.message_session import MessageSession
 
@@ -21,9 +23,11 @@ VALID_TAG_PATTERN = re.compile(r"<<SMART_FOLLOWUP\|(NEVER|[1-9]\d*)>>", re.I)
 EVENT_REVISION = "smart_followup_revision"
 EVENT_REQUEST = "smart_followup_request"
 EVENT_DECISION = "smart_followup_decision"
+EVENT_SYSTEM_PROMPT = "smart_followup_system_prompt"
 WAKE_EVENT = "smart_followup_wake"
 WAKE_PROMPT = "smart_followup_wake_prompt"
 LOG_PREFIX = "[smart_followup]"
+LAST_PRIORITY = float("-inf")
 
 
 class SmartFollowupPlugin(Star):
@@ -124,7 +128,7 @@ class SmartFollowupPlugin(Star):
         event.set_extra(EVENT_REVISION, revision)
         event.set_extra("enable_streaming", False)
 
-    @filter.on_llm_request(priority=-100000)
+    @filter.on_llm_request(priority=LAST_PRIORITY)
     async def inject_prompt(
         self, event: AstrMessageEvent, request: ProviderRequest
     ) -> None:
@@ -143,12 +147,6 @@ class SmartFollowupPlugin(Star):
         if self._revisions.get(event.unified_msg_origin) != revision:
             event.stop_event()
             return
-
-        system_prompt = PROMPT_PATTERN.sub("", request.system_prompt or "").rstrip()
-        request.system_prompt = (
-            f"{system_prompt}\n\n{PROMPT_START}\n"
-            f"{str(self.config['decision_prompt']).strip()}\n{PROMPT_END}"
-        ).strip()
 
         temporary_text = (
             "<smart_followup_context>\n"
@@ -184,6 +182,47 @@ class SmartFollowupPlugin(Star):
             )
 
         event.set_extra(EVENT_REQUEST, request)
+
+    @filter.on_agent_begin(priority=LAST_PRIORITY)
+    async def inject_system_prompt(
+        self,
+        event: AstrMessageEvent,
+        run_context: ContextWrapper[AstrAgentContext],
+    ) -> None:
+        """在 Agent 消息完成组装后注入并保存最终系统提示词。
+
+        Args:
+            event: 当前消息事件。
+            run_context: 即将交给模型的 Agent 上下文。
+        """
+        revision = event.get_extra(EVENT_REVISION)
+        if (
+            not self._eligible(event)
+            or not isinstance(revision, int)
+            or self._revisions.get(event.unified_msg_origin) != revision
+        ):
+            return
+
+        system_message = next(
+            (message for message in run_context.messages if message.role == "system"),
+            None,
+        )
+        system_prompt = (
+            system_message.content
+            if system_message and isinstance(system_message.content, str)
+            else ""
+        )
+        system_prompt = (
+            f"{PROMPT_PATTERN.sub('', system_prompt).rstrip()}\n\n{PROMPT_START}\n"
+            f"{str(self.config['decision_prompt']).strip()}\n{PROMPT_END}"
+        ).strip()
+        if system_message:
+            system_message.content = system_prompt
+        else:
+            run_context.messages.insert(
+                0, Message(role="system", content=system_prompt)
+            )
+        event.set_extra(EVENT_SYSTEM_PROMPT, system_prompt)
 
     @filter.on_llm_response(priority=100000)
     async def read_decision(
@@ -240,8 +279,10 @@ class SmartFollowupPlugin(Star):
         """
         decision = event.get_extra(EVENT_DECISION)
         request = event.get_extra(EVENT_REQUEST)
+        system_prompt = event.get_extra(EVENT_SYSTEM_PROMPT)
         event.set_extra(EVENT_DECISION, None)
         event.set_extra(EVENT_REQUEST, None)
+        event.set_extra(EVENT_SYSTEM_PROMPT, None)
         if not self._eligible(event) or not isinstance(decision, tuple):
             return
 
@@ -251,9 +292,12 @@ class SmartFollowupPlugin(Star):
             return
 
         if isinstance(value, str):
-            if not isinstance(request, ProviderRequest):
+            if not isinstance(request, ProviderRequest) or not isinstance(
+                system_prompt, str
+            ):
                 logger.warning(
-                    "%s Retry skipped without original request: session=%s revision=%s",
+                    "%s Retry skipped without captured Agent request: "
+                    "session=%s revision=%s",
                     LOG_PREFIX,
                     umo,
                     revision,
@@ -282,8 +326,7 @@ class SmartFollowupPlugin(Star):
                     ),
                     prompt=str(self.config["retry_prompt"]).strip(),
                     contexts=contexts,
-                    system_prompt=request.system_prompt,
-                    tools=request.func_tool,
+                    system_prompt=system_prompt,
                     model=request.model,
                     session_id=request.session_id,
                 )

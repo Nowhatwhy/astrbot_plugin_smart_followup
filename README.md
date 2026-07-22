@@ -18,11 +18,11 @@
 <<SMART_FOLLOWUP|NEVER>>
 ```
 
-主模型漏掉标签时，当前回复仍会先正常发送，然后插件复用相同模型、system prompt、历史和工具定义补做一次内部时间决策。补决策不会进入完整 Agent，也不会保存到对话历史；再次漏掉标签时不创建计时器。
+主模型漏掉标签时，当前回复仍会先正常发送，然后插件复用相同模型、Agent 开始阶段捕获的 system prompt、历史和工具定义补做一次内部时间决策。补决策不会进入完整 Agent，也不会保存到对话历史；再次漏掉标签时不创建计时器。
 
 ## 提示词和缓存
 
-- `decision_prompt` 是稳定规则，追加到 system prompt。
+- `decision_prompt` 是稳定规则，在 `on_agent_begin` 阶段追加到已经组装好的 system 消息。
 - 当前时间和 `user_prompt_reminder` 是不保存的临时 user 内容。
 - `retry_prompt` 只用于漏标签后的内部决策。
 - `wake_prompt` 只用于到点后的完整 Agent 唤醒，并作为不保存的临时 user 内容进入最终请求。
