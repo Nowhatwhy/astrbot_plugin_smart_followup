@@ -24,6 +24,7 @@ EVENT_REQUEST = "smart_followup_request"
 EVENT_DECISION = "smart_followup_decision"
 WAKE_EVENT = "smart_followup_wake"
 WAKE_PROMPT = "smart_followup_wake_prompt"
+LOG_PREFIX = "[smart_followup]"
 
 
 class SmartFollowupPlugin(Star):
@@ -204,6 +205,13 @@ class SmartFollowupPlugin(Star):
             return
 
         decision = self._parse_response(response)
+        logger.info(
+            "%s Decision parsed: session=%s revision=%s result=%s",
+            LOG_PREFIX,
+            event.unified_msg_origin,
+            revision,
+            "MISSING" if decision is None else decision,
+        )
         if decision == "NEVER":
             event.set_extra(EVENT_REQUEST, None)
             event.set_extra(EVENT_DECISION, None)
@@ -234,7 +242,19 @@ class SmartFollowupPlugin(Star):
 
         if isinstance(value, str):
             if not isinstance(request, ProviderRequest):
+                logger.warning(
+                    "%s Retry skipped without original request: session=%s revision=%s",
+                    LOG_PREFIX,
+                    umo,
+                    revision,
+                )
                 return
+            logger.info(
+                "%s Retry started: session=%s revision=%s",
+                LOG_PREFIX,
+                umo,
+                revision,
+            )
             contexts = list(request.contexts)
             user_context = await request.assemble_context()
             content = user_context.get("content")
@@ -258,9 +278,21 @@ class SmartFollowupPlugin(Star):
                     session_id=request.session_id,
                 )
             except Exception:
-                logger.exception("[smart_followup] Retry decision failed: %s", umo)
+                logger.exception(
+                    "%s Retry failed: session=%s revision=%s",
+                    LOG_PREFIX,
+                    umo,
+                    revision,
+                )
                 return
             value = self._parse_response(retry_response)
+            logger.info(
+                "%s Retry parsed: session=%s revision=%s result=%s",
+                LOG_PREFIX,
+                umo,
+                revision,
+                "MISSING" if value is None else value,
+            )
 
         if not isinstance(value, int) or self._revisions.get(umo) != revision:
             return
@@ -312,7 +344,7 @@ class SmartFollowupPlugin(Star):
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("[smart_followup] Wake failed: %s", umo)
+            logger.exception("%s Wake failed: session=%s", LOG_PREFIX, umo)
         finally:
             if self._tasks.get(umo) is asyncio.current_task():
                 self._tasks.pop(umo, None)
