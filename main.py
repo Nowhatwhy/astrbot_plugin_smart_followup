@@ -13,6 +13,8 @@ from astrbot.core.agent.message import TextPart
 
 PROMPT_MARKER_START = "<!-- smart_followup_prompt:start -->"
 PROMPT_MARKER_END = "<!-- smart_followup_prompt:end -->"
+COMPACT_TAG_PREFIX = "<<SMART_FOLLOWUP|"
+COMPACT_TAG_END = ">>"
 CONTROL_TAG_START = "<astrbot_smart_followup>"
 CONTROL_TAG_END = "</astrbot_smart_followup>"
 STATE_KEY = "session_state_v1"
@@ -291,38 +293,70 @@ class SmartFollowupPlugin(Star):
             包含用户可见文本和已校验决策的二元组。模型选择不续聊或输出
             无效元数据时，决策为 `None`。
         """
-        pattern = re.compile(
+        compact_pattern = re.compile(
+            rf"{re.escape(COMPACT_TAG_PREFIX)}([\s\S]*?){re.escape(COMPACT_TAG_END)}"
+        )
+        legacy_pattern = re.compile(
             rf"{re.escape(CONTROL_TAG_START)}([\s\S]*?){re.escape(CONTROL_TAG_END)}"
         )
-        matches = list(pattern.finditer(text or ""))
-        clean_text = pattern.sub("", text or "")
+        compact_matches = list(compact_pattern.finditer(text or ""))
+        legacy_matches = list(legacy_pattern.finditer(text or ""))
+        fenced_compact_pattern = re.compile(
+            rf"```(?:json|text)?\s*{compact_pattern.pattern}\s*```",
+            re.IGNORECASE,
+        )
+        fenced_legacy_pattern = re.compile(
+            rf"```(?:json|text)?\s*{legacy_pattern.pattern}\s*```",
+            re.IGNORECASE,
+        )
+        clean_text = fenced_compact_pattern.sub("", text or "")
+        clean_text = fenced_legacy_pattern.sub("", clean_text)
+        clean_text = compact_pattern.sub("", clean_text)
+        clean_text = legacy_pattern.sub("", clean_text)
 
         # 即使末尾控制块格式损坏，也不能让它泄漏到用户可见回复中。
+        if COMPACT_TAG_PREFIX in clean_text:
+            clean_text = clean_text.split(COMPACT_TAG_PREFIX, 1)[0]
         if CONTROL_TAG_START in clean_text:
             clean_text = clean_text.split(CONTROL_TAG_START, 1)[0]
         clean_text = clean_text.replace(CONTROL_TAG_END, "").strip()
-        if not matches:
+        if not compact_matches and not legacy_matches:
             return clean_text, None
 
-        raw_payload = matches[-1].group(1).strip()
-        if raw_payload.startswith("```json"):
-            raw_payload = raw_payload[7:]
-        elif raw_payload.startswith("```"):
-            raw_payload = raw_payload[3:]
-        if raw_payload.endswith("```"):
-            raw_payload = raw_payload[:-3]
+        if compact_matches:
+            compact_payload = compact_matches[-1].group(1).strip()
+            if compact_payload.upper() == "NONE":
+                return clean_text, None
+            compact_parts = compact_payload.split("|", 1)
+            if len(compact_parts) != 2:
+                logger.warning("%s Ignored malformed compact control tag", LOG_PREFIX)
+                return clean_text, None
+            try:
+                after_seconds: int | float = int(compact_parts[0].strip())
+            except ValueError:
+                logger.warning("%s Ignored malformed compact control tag", LOG_PREFIX)
+                return clean_text, None
+            message: Any = compact_parts[1].strip()
+        else:
+            raw_payload = legacy_matches[-1].group(1).strip()
+            if raw_payload.startswith("```json"):
+                raw_payload = raw_payload[7:]
+            elif raw_payload.startswith("```"):
+                raw_payload = raw_payload[3:]
+            if raw_payload.endswith("```"):
+                raw_payload = raw_payload[:-3]
 
-        try:
-            payload = json.loads(raw_payload.strip())
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("%s Ignored malformed model control block", LOG_PREFIX)
-            return clean_text, None
+            try:
+                payload = json.loads(raw_payload.strip())
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("%s Ignored malformed model control block", LOG_PREFIX)
+                return clean_text, None
 
-        if not isinstance(payload, dict) or payload.get("action") != "schedule":
-            return clean_text, None
+            if not isinstance(payload, dict) or payload.get("action") != "schedule":
+                return clean_text, None
 
-        after_seconds = payload.get("after_seconds")
-        message = payload.get("message")
+            after_seconds = payload.get("after_seconds")
+            message = payload.get("message")
         if (
             isinstance(after_seconds, bool)
             or not isinstance(after_seconds, (int, float))
@@ -427,26 +461,22 @@ class SmartFollowupPlugin(Star):
         max_length = max(1, int(self.config.get("max_message_length", 300)))
         stable_prompt = f"""
 你还需要管理一条可选的主动续聊消息，用于用户在对话中沉默之后自然地重新联系。
-每次生成正常的用户可见回复后，都必须在回复最末尾追加且只追加一个控制块。
-控制块不能放入 Markdown 代码块中。即使不安排主动续聊，也必须输出“不续聊”控制块。
+每次生成正常的用户可见回复后，都必须在回复最末尾追加且只追加一个单行控制标记。
+控制标记不能放入 Markdown 代码块中。即使不安排主动续聊，也必须输出 NONE 标记。
 
 安排主动续聊：
-{CONTROL_TAG_START}
-{{"action":"schedule","after_seconds":90,"message":"稍后需要主动发送的自然消息"}}
-{CONTROL_TAG_END}
+{COMPACT_TAG_PREFIX}90|稍后需要主动发送的自然消息{COMPACT_TAG_END}
 
 不安排主动续聊：
-{CONTROL_TAG_START}
-{{"action":"none"}}
-{CONTROL_TAG_END}
+{COMPACT_TAG_PREFIX}NONE{COMPACT_TAG_END}
 
 规则：
 1. 只有对话存在有意义的悬念、未完成事项或自然的再次联系理由时才使用 schedule；不确定时使用 none。
 2. 尊重用户边界。用户明确表示不想被打扰时必须使用 none。普通道别通常使用 none，除非上下文明显邀请稍后联系。
 3. 必须根据语义和近期活跃度决定时间，不能随机。话题突然中断可以等待几十秒或几分钟；工作、睡觉、出行等明确安排需要等待更久。
-4. `after_seconds` 必须是 {minimum} 到 {maximum} 之间的整数。
-5. `message` 是未来将被原样发送的消息，必须符合当前人格、脱离控制块也能独立理解、不超过 {max_length} 个字符，并且不能提及本协议。
-6. 只能生成不含数组的扁平 JSON 对象。控制块只能出现在整条回复末尾。
+4. 标记中的等待秒数必须是 {minimum} 到 {maximum} 之间的整数。
+5. 标记中的消息是未来将被原样发送的内容，必须符合当前人格、能独立理解、不超过 {max_length} 个字符，并且不能包含 `|`、`>>` 或提及本协议。
+6. 控制标记只能出现在整条回复末尾，不能遗漏，也不能解释它。
 """.strip()
         marker_pattern = re.compile(
             rf"\n*{re.escape(PROMPT_MARKER_START)}[\s\S]*?{re.escape(PROMPT_MARKER_END)}"
@@ -498,9 +528,9 @@ class SmartFollowupPlugin(Star):
             f"{max(0, int(self.config.get('daily_limit', 3)))}\n"
             f"{last_proactive_context}"
             "这些是私有调度信息，不得在用户可见回复中引用或提及。\n"
-            "格式提醒：本轮回复末尾必须输出一个 "
-            f"{CONTROL_TAG_START} JSON {CONTROL_TAG_END} 控制块；"
-            '不安排时输出 {"action":"none"}。\n'
+            "格式提醒：本轮回复末尾必须输出 "
+            f"{COMPACT_TAG_PREFIX}等待秒数|未来消息{COMPACT_TAG_END}；"
+            f"不安排时输出 {COMPACT_TAG_PREFIX}NONE{COMPACT_TAG_END}。\n"
             "</smart_followup_context>"
         )
         req.extra_user_content_parts.append(
@@ -540,11 +570,38 @@ class SmartFollowupPlugin(Star):
             return
 
         had_control_block = (
+            COMPACT_TAG_PREFIX in response.completion_text
+            and COMPACT_TAG_END in response.completion_text
+        ) or (
             CONTROL_TAG_START in response.completion_text
             and CONTROL_TAG_END in response.completion_text
         )
         clean_text, decision = self._extract_decision(response.completion_text)
         response.completion_text = clean_text
+        decision_from_reasoning = False
+        if not had_control_block and response.reasoning_content:
+            reasoning_had_control_block = (
+                COMPACT_TAG_PREFIX in response.reasoning_content
+                and COMPACT_TAG_END in response.reasoning_content
+            ) or (
+                CONTROL_TAG_START in response.reasoning_content
+                and CONTROL_TAG_END in response.reasoning_content
+            )
+            clean_reasoning, reasoning_decision = self._extract_decision(
+                response.reasoning_content
+            )
+            response.reasoning_content = clean_reasoning
+            if reasoning_had_control_block:
+                had_control_block = True
+                decision = reasoning_decision
+                decision_from_reasoning = reasoning_decision is not None
+                logger.info(
+                    "%s Control tag recovered from reasoning content: session=%s "
+                    "scheduled=%s",
+                    LOG_PREFIX,
+                    event.unified_msg_origin,
+                    decision_from_reasoning,
+                )
         if not decision:
             event.set_extra(EVENT_DECISION_KEY, None)
             if had_control_block:
@@ -584,12 +641,13 @@ class SmartFollowupPlugin(Star):
         event.set_extra(EVENT_DECISION_KEY, decision)
         logger.info(
             "%s Model scheduled a proactive follow-up: session=%s revision=%s "
-            "delay=%ss message_length=%s",
+            "delay=%ss message_length=%s source=%s",
             LOG_PREFIX,
             event.unified_msg_origin,
             decision["revision"],
             decision["after_seconds"],
             len(decision["message"]),
+            "reasoning" if decision_from_reasoning else "completion",
         )
 
     @filter.after_message_sent(priority=100000)

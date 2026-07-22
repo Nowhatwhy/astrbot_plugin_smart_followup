@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import LLMResponse, ProviderRequest
 
 from data.plugins.astrbot_plugin_smart_followup.main import SmartFollowupPlugin
 
@@ -25,9 +25,7 @@ class SmartFollowupDecisionTest(unittest.TestCase):
         """有效调度决策应被返回，且控制元数据不得泄漏。"""
         text = (
             "当前回复\n"
-            '<astrbot_smart_followup>{"action":"schedule",'
-            '"after_seconds":90,"message":"稍后再聊"}'
-            "</astrbot_smart_followup>"
+            "<<SMART_FOLLOWUP|90|稍后再聊>>"
         )
 
         clean_text, decision = self.plugin._extract_decision(text)
@@ -45,22 +43,50 @@ class SmartFollowupDecisionTest(unittest.TestCase):
     def test_none_action_produces_no_schedule(self) -> None:
         """明确选择不续聊时只清理响应，不生成调度决策。"""
         clean_text, decision = self.plugin._extract_decision(
-            '再见\n<astrbot_smart_followup>{"action":"none"}'
-            "</astrbot_smart_followup>"
+            "再见\n<<SMART_FOLLOWUP|NONE>>"
         )
 
         self.assertEqual(clean_text, "再见")
         self.assertIsNone(decision)
 
+    def test_legacy_json_control_block_remains_compatible(self) -> None:
+        """旧版 XML 与 JSON 控制块仍应能够被解析。"""
+        clean_text, decision = self.plugin._extract_decision(
+            '回复<astrbot_smart_followup>{"action":"schedule",'
+            '"after_seconds":60,"message":"旧格式"}</astrbot_smart_followup>'
+        )
+
+        self.assertEqual(clean_text, "回复")
+        self.assertEqual(decision["after_seconds"], 60)
+        self.assertEqual(decision["message"], "旧格式")
+
+    def test_markdown_fence_around_legacy_block_is_removed(self) -> None:
+        """包裹旧版控制块的 JSON 代码围栏不得残留在回复中。"""
+        clean_text, decision = self.plugin._extract_decision(
+            '回复\n```json\n<astrbot_smart_followup>{"action":"schedule",'
+            '"after_seconds":60,"message":"围栏格式"}'
+            "</astrbot_smart_followup>\n```"
+        )
+
+        self.assertEqual(clean_text, "回复")
+        self.assertEqual(decision["message"], "围栏格式")
+
+    def test_markdown_fence_around_compact_tag_is_removed(self) -> None:
+        """包裹短标记的代码围栏也不得残留在回复中。"""
+        clean_text, decision = self.plugin._extract_decision(
+            "回复\n```text\n<<SMART_FOLLOWUP|45|围栏短标记>>\n```"
+        )
+
+        self.assertEqual(clean_text, "回复")
+        self.assertEqual(decision["message"], "围栏短标记")
+
     def test_delay_is_clamped_to_configured_bounds(self) -> None:
         """模型输出的越界等待时间应被确定性规则限制。"""
         _, short_decision = self.plugin._extract_decision(
-            '<astrbot_smart_followup>{"action":"schedule",'
-            '"after_seconds":1,"message":"短"}</astrbot_smart_followup>'
+            "<<SMART_FOLLOWUP|1|短>>"
         )
         _, long_decision = self.plugin._extract_decision(
-            '<astrbot_smart_followup>{"action":"schedule",'
-            '"after_seconds":99999,"message":"长"}</astrbot_smart_followup>'
+            "<<SMART_FOLLOWUP|99999|长>>"
         )
 
         self.assertEqual(short_decision["after_seconds"], 30)
@@ -69,7 +95,7 @@ class SmartFollowupDecisionTest(unittest.TestCase):
     def test_malformed_trailing_block_is_hidden(self) -> None:
         """格式损坏的控制元数据不得出现在用户可见回复中。"""
         clean_text, decision = self.plugin._extract_decision(
-            "正常内容<astrbot_smart_followup>{broken"
+            "正常内容<<SMART_FOLLOWUP|broken"
         )
 
         self.assertEqual(clean_text, "正常内容")
@@ -170,9 +196,36 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(request.extra_user_content_parts), 1)
         part = request.extra_user_content_parts[0]
         self.assertIn("12s, 18s", part.text)
-        self.assertIn("<astrbot_smart_followup>", part.text)
-        self.assertIn('{"action":"none"}', part.text)
+        self.assertIn("<<SMART_FOLLOWUP|", part.text)
+        self.assertIn("<<SMART_FOLLOWUP|NONE>>", part.text)
         self.assertTrue(part._no_save)
+
+    async def test_schedule_can_be_recovered_from_reasoning_content(self) -> None:
+        """推理区中的控制标记也应生成调度决策并被清理。"""
+        self.plugin._sessions["umo"] = {
+            "revision": 3,
+            "daily_date": "",
+            "daily_count": 0,
+        }
+        extras = {}
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            is_private_chat=lambda: True,
+            set_extra=extras.__setitem__,
+        )
+        response = LLMResponse(
+            role="assistant",
+            completion_text="正常回复",
+            reasoning_content="分析<<SMART_FOLLOWUP|45|继续说呀>>",
+        )
+
+        await self.plugin.parse_followup_decision(event, response)
+
+        self.assertEqual(response.reasoning_content, "分析")
+        self.assertEqual(extras["smart_followup_decision"]["revision"], 3)
+        self.assertEqual(
+            extras["smart_followup_decision"]["message"], "继续说呀"
+        )
 
 
 if __name__ == "__main__":
