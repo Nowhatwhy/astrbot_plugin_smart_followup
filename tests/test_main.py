@@ -166,10 +166,12 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin.inject_followup_protocol(event, request)
 
         self.assertEqual(request.system_prompt.count("smart_followup_prompt:start"), 1)
-        self.assertNotIn("Recent intervals between user messages", request.system_prompt)
+        self.assertNotIn("近期用户消息间隔", request.system_prompt)
         self.assertEqual(len(request.extra_user_content_parts), 1)
         part = request.extra_user_content_parts[0]
         self.assertIn("12s, 18s", part.text)
+        self.assertIn("<astrbot_smart_followup>", part.text)
+        self.assertIn('{"action":"none"}', part.text)
         self.assertTrue(part._no_save)
 
 

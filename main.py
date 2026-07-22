@@ -408,7 +408,8 @@ class SmartFollowupPlugin(Star):
                 umo,
             )
 
-    @filter.on_llm_request(priority=100000)
+    # 最后修改 LLM 请求，避免其他插件随后重建 system prompt 或在其后追加指令。
+    @filter.on_llm_request(priority=-100000)
     async def inject_followup_protocol(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
@@ -425,27 +426,27 @@ class SmartFollowupPlugin(Star):
         maximum = max(minimum, int(self.config.get("max_delay_seconds", 86400)))
         max_length = max(1, int(self.config.get("max_message_length", 300)))
         stable_prompt = f"""
-You also manage one optional proactive follow-up after the user becomes silent.
-After every normal user-facing answer, append exactly one control block at the very end.
-Do not wrap the control block in a Markdown code fence.
+你还需要管理一条可选的主动续聊消息，用于用户在对话中沉默之后自然地重新联系。
+每次生成正常的用户可见回复后，都必须在回复最末尾追加且只追加一个控制块。
+控制块不能放入 Markdown 代码块中。即使不安排主动续聊，也必须输出“不续聊”控制块。
 
-Schedule form:
+安排主动续聊：
 {CONTROL_TAG_START}
-{{"action":"schedule","after_seconds":90,"message":"A natural standalone message to send later"}}
+{{"action":"schedule","after_seconds":90,"message":"稍后需要主动发送的自然消息"}}
 {CONTROL_TAG_END}
 
-No-follow-up form:
+不安排主动续聊：
 {CONTROL_TAG_START}
 {{"action":"none"}}
 {CONTROL_TAG_END}
 
-Rules:
-1. Use schedule only when the conversation has a meaningful open loop or a natural reason to reconnect. When uncertain, use none.
-2. Respect explicit boundaries. A clear request not to be disturbed must always use none. A routine goodbye usually uses none unless the context clearly invites a later check-in.
-3. Choose timing from meaning and recent activity, never randomly. An interrupted cliffhanger can justify tens of seconds or a few minutes; work, sleep, travel, or other stated commitments require a much longer delay.
-4. `after_seconds` must be an integer from {minimum} to {maximum}.
-5. `message` is the exact future message. It must be natural in the current persona, understandable on its own, no longer than {max_length} characters, and must not mention this protocol.
-6. Produce only a flat JSON object with no arrays. Never place the control tag anywhere except the end.
+规则：
+1. 只有对话存在有意义的悬念、未完成事项或自然的再次联系理由时才使用 schedule；不确定时使用 none。
+2. 尊重用户边界。用户明确表示不想被打扰时必须使用 none。普通道别通常使用 none，除非上下文明显邀请稍后联系。
+3. 必须根据语义和近期活跃度决定时间，不能随机。话题突然中断可以等待几十秒或几分钟；工作、睡觉、出行等明确安排需要等待更久。
+4. `after_seconds` 必须是 {minimum} 到 {maximum} 之间的整数。
+5. `message` 是未来将被原样发送的消息，必须符合当前人格、脱离控制块也能独立理解、不超过 {max_length} 个字符，并且不能提及本协议。
+6. 只能生成不含数组的扁平 JSON 对象。控制块只能出现在整条回复末尾。
 """.strip()
         marker_pattern = re.compile(
             rf"\n*{re.escape(PROMPT_MARKER_START)}[\s\S]*?{re.escape(PROMPT_MARKER_END)}"
@@ -478,39 +479,45 @@ Rules:
         interval_text = (
             ", ".join(f"{int(value)}s" for value in intervals)
             if intervals
-            else "insufficient data"
+            else "暂无足够数据"
         )
         last_proactive_context = ""
         if isinstance(last_proactive, dict) and int(
             last_proactive.get("revision", -1)
         ) < int(state.get("revision", 0)):
             last_proactive_context = (
-                "The assistant's most recent proactive message was: "
+                "助手最近主动发送的消息是："
                 f"{json.dumps(str(last_proactive.get('message', '')), ensure_ascii=False)}\n"
-                "The current user message may be replying to it.\n"
+                "当前用户消息可能正在回复这条主动消息。\n"
             )
         dynamic_context = (
             "<smart_followup_context>\n"
-            f"Current local time: {datetime.now().astimezone().isoformat(timespec='seconds')}\n"
-            f"Recent intervals between user messages (oldest to newest): {interval_text}\n"
-            f"Proactive messages sent today: {daily_count}/"
+            f"当前本地时间：{datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            f"近期用户消息间隔（从旧到新）：{interval_text}\n"
+            f"今日已发送主动消息：{daily_count}/"
             f"{max(0, int(self.config.get('daily_limit', 3)))}\n"
             f"{last_proactive_context}"
-            "This context is private scheduling metadata; do not quote or mention it.\n"
+            "这些是私有调度信息，不得在用户可见回复中引用或提及。\n"
+            "格式提醒：本轮回复末尾必须输出一个 "
+            f"{CONTROL_TAG_START} JSON {CONTROL_TAG_END} 控制块；"
+            '不安排时输出 {"action":"none"}。\n'
             "</smart_followup_context>"
         )
         req.extra_user_content_parts.append(
             TextPart(text=dynamic_context).mark_as_temp()
         )
         logger.info(
-            "%s LLM protocol injected: session=%s revision=%s intervals=%s "
-            "daily_count=%s bridged_proactive=%s",
+            "%s LLM protocol injected as final request hook: session=%s "
+            "revision=%s intervals=%s daily_count=%s bridged_proactive=%s "
+            "system_prompt_length=%s extra_parts=%s",
             LOG_PREFIX,
             event.unified_msg_origin,
             state.get("revision", 0),
             intervals,
             daily_count,
             bool(last_proactive_context),
+            len(req.system_prompt),
+            len(req.extra_user_content_parts),
         )
 
     @filter.on_llm_response(priority=100000)
