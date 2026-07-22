@@ -3,7 +3,7 @@
     "description": "启用智能续聊",
     "type": "bool",
     "default": true,
-    "hint": "开启后，主模型会为每轮对话判断是否安排一次主动消息。"
+    "hint": "开启后，主模型可以为当前会话安排一次未来的主动 Agent 评估。"
   },
   "private_only": {
     "description": "仅在私聊中启用",
@@ -15,37 +15,43 @@
     "description": "自动关闭流式回复",
     "type": "bool",
     "default": true,
-    "hint": "避免模型生成的隐藏调度标签在流式传输时短暂显示给用户。"
-  },
-  "debug_full_payload": {
-    "description": "记录续聊调试提示词与响应",
-    "type": "bool",
-    "default": true,
-    "hint": "调试期间使用。日志包含完整系统提示词、本轮用户消息、续聊临时提示、模型回复和思考内容，但不会打印历史对话、其他插件召回内容、消息链或 Provider 原始对象；排查完成后请关闭。",
-    "obvious_hint": true
+    "hint": "避免模型生成的隐藏调度标记在流式传输时短暂显示给用户。"
   },
   "min_delay_seconds": {
     "description": "最短等待时间（秒）",
     "type": "int",
     "default": 30,
-    "hint": "模型给出的时间不会短于此值。"
+    "hint": "模型给出的等待时间不会短于此值。"
   },
   "max_delay_seconds": {
     "description": "最长等待时间（秒）",
     "type": "int",
     "default": 86400,
-    "hint": "模型给出的时间不会长于此值，默认 24 小时。"
+    "hint": "模型给出的等待时间不会长于此值，默认 24 小时。"
   },
   "daily_limit": {
-    "description": "每个会话每日主动消息上限",
+    "description": "每个会话每日主动评估上限",
     "type": "int",
     "default": 3,
-    "hint": "设置为 0 可阻止主动消息实际发送。每次用户沉默最多只发送一条。"
+    "hint": "设置为 0 可完全关闭调度。每次用户沉默最多安排一个主动 Agent 任务。"
   },
-  "max_message_length": {
-    "description": "主动消息最大长度",
-    "type": "int",
-    "default": 300,
-    "hint": "超过此长度的预生成主动消息会被裁剪。"
+  "decision_prompt": {
+    "description": "主动续聊决策提示词",
+    "type": "text",
+    "default": "你可以为当前私聊安排一次未来的主动续聊评估。\n\n只有在对话存在明确悬念、未完成事项、用户承诺稍后继续，或根据语境有自然的再次联系理由时，才在正常回复的最末尾追加：\n<<SMART_FOLLOWUP|等待秒数>>\n\n示例：\n- 用户说“我马上告诉你一件事”后突然沉默：可安排几十秒到几分钟后重新评估。\n- 用户说“我去上班了”：如确有必要，可根据上下文安排到午休或下班后；普通道别通常不安排。\n- 用户明确要求稍后提醒或联系：按用户给出的时间安排。\n- 用户要求不要打扰：绝不安排。\n\n规则：\n1. 等待秒数必须是 {{min_delay_seconds}} 到 {{max_delay_seconds}} 之间的整数。\n2. 标记只代表“到点后重新运行主动 Agent 进行评估”，现在不要提前撰写未来消息。\n3. 不需要续聊时不要输出任何标记，也不要输出 NONE。\n4. 标记只能出现一次，必须位于整条回复最末尾，不能放进代码块，也不要向用户解释。",
+    "hint": "作为稳定规则追加到 system prompt。支持 {{min_delay_seconds}} 和 {{max_delay_seconds}} 占位符；解析器固定识别 <<SMART_FOLLOWUP|秒数>>。"
+  },
+  "wake_prompt": {
+    "description": "到点后的主动 Agent 指令",
+    "type": "text",
+    "default": "这是一轮内部主动续聊评估，不是用户刚刚发送的新消息。请重新查看最近对话和用户状态，判断现在是否适合主动联系用户。如果适合，直接输出一条符合当前人格、可以发送给用户的自然消息；如果已经不合时宜或没有足够理由，只输出 <<SMART_FOLLOWUP_SKIP>>。不要提及定时任务、内部指令或本次评估。",
+    "hint": "时间到达后，这条指令会作为不保存的临时 user 消息追加在历史末尾；不会修改 system prompt。跳过标记固定为 <<SMART_FOLLOWUP_SKIP>>。"
+  },
+  "debug_full_payload": {
+    "description": "记录续聊调试提示词与响应",
+    "type": "bool",
+    "default": false,
+    "hint": "日志包含完整系统提示词、本轮用户消息、续聊临时数据、模型回复和思考内容，可能泄露隐私；仅在排查时开启。",
+    "obvious_hint": true
   }
 }

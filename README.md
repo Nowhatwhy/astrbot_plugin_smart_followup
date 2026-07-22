@@ -1,30 +1,49 @@
 # astrbot_plugin_smart_followup
 
-让 AstrBot Agent 理解对话中的沉默，并在合适的时间主动续上话题。
+让 AstrBot Agent 理解对话中的沉默，并在合适的时间重新运行主动 Agent，决定是否自然地续上话题。
 
 ## 工作方式
 
-插件不会随机选择时间，也不会为时间判断额外调用一次模型。它在主模型的系统提示词末尾注入一份固定协议，让模型在正常回复后输出隐藏的单行决策：
+插件不会让当前模型提前写好未来消息。当前回复只负责决定是否需要在未来重新评估；需要时在正文末尾输出：
 
 ```text
-<<SMART_FOLLOWUP|90|所以你刚才想说什么呀？>>
+<<SMART_FOLLOWUP|90>>
 ```
 
-不需要主动续聊时输出 `<<SMART_FOLLOWUP|NONE>>`。插件仍兼容早期的 XML 与 JSON 控制块。
+插件清除标记，并在当前回复发送完成后维护一次本地等待任务。时间到达后，插件会构造内部临时事件，重新进入与普通用户消息相同的 AstrBot 消息管线，由新的 Agent 根据到点时的上下文决定是否发送，以及发送什么内容。
 
-插件在发送回复前移除该控制块，并在主回复成功发送后创建定时任务。用户在等待期间发送任何新消息，旧任务都会立即失效；新一轮对话会根据最新上下文重新决定。
+不需要主动续聊时不输出任何标记。解析器只接受 `<<SMART_FOLLOWUP|等待秒数>>`；包含预生成消息的旧格式和 XML/JSON 控制块都会被拒绝，不会创建任务。
+
+等待期间只要用户发送新消息，插件就会删除旧任务；新一轮对话根据最新上下文重新决定。
+
+## 提示词放置
+
+- 稳定的决策规则放在 system prompt 末尾，可通过 `decision_prompt` 配置。
+- 当前时间、近期消息间隔和每日调度次数通过临时 `extra_user_content_parts` 放在本轮用户输入之后。
+- 动态内容使用 `mark_as_temp()`，不会写入会话历史。
+- 到点后的 `wake_prompt` 只作为历史末尾的临时 user 消息，不修改 system prompt，也不会保存到历史。
+- 不在用户提示词末尾重复完整决策协议，避免把稳定规则降级成普通用户内容。
+
+普通对话和到点唤醒使用完全相同的 system prompt。已有的 system prompt 与长对话历史仍是共同前缀，只有末尾新增的临时唤醒消息需要重新计算，从而保留提供商的前缀缓存命中。
+
+`decision_prompt` 支持以下占位符：
+
+- `{{min_delay_seconds}}`
+- `{{max_delay_seconds}}`
+
+解析器固定识别 `<<SMART_FOLLOWUP|秒数>>`，自定义提示词时应保留这一格式。
 
 ## 特性
 
-- 单次主 LLM 调用同时生成当前回复和未来主动消息
-- 根据当前时间、近期用户消息间隔和对话语义决定等待时间
-- 一个会话始终最多保留一个待发送任务
-- 用户新消息通过会话版本号可靠地使旧任务失效
-- 待发送任务使用 AstrBot 插件 KV 存储，重载或重启后可以恢复
-- 下一轮请求会临时补充上一条主动消息，让模型理解用户正在回复什么
-- 每会话每日主动消息上限
+- 当前回复只选择重新评估时间，不提前生成未来消息
+- 到点后通过普通消息管线重新运行 AstrBot Agent
+- 唤醒指令仅作为临时 user 消息追加，不改写 system prompt
+- 用户新消息自动取消旧任务
+- 待执行时间由插件存储持久化，插件重载或 AstrBot 重启后可恢复
+- 根据当前时间、近期活跃度和语义决定等待时间
+- 每个会话每日主动评估上限
 - 默认只处理私聊
-- 默认关闭流式回复，防止隐藏标签短暂泄漏
+- 默认关闭流式回复，防止调度标记短暂泄漏
 - 无第三方 Python 依赖
 
 ## 安装
@@ -44,41 +63,25 @@ git clone https://github.com/Nowhatwhy/astrbot_plugin_smart_followup.git
 | --- | ---: | --- |
 | `enabled` | `true` | 启用插件 |
 | `private_only` | `true` | 仅处理私聊 |
-| `disable_streaming` | `true` | 防止控制标签在流式输出中泄漏 |
-| `debug_full_payload` | `true` | 临时记录完整 LLM 请求与响应，排查完成后应关闭 |
+| `disable_streaming` | `true` | 防止调度标记在流式输出中泄漏 |
 | `min_delay_seconds` | `30` | 最短等待秒数 |
 | `max_delay_seconds` | `86400` | 最长等待秒数 |
-| `daily_limit` | `3` | 每个会话每日主动消息上限 |
-| `max_message_length` | `300` | 主动消息最大字符数 |
-
-动态的当前时间和活跃度信息通过临时 `extra_user_content_parts` 追加在本轮用户输入之后，不会写入会话历史，也不会让 system prompt 每轮变化。固定协议只会在插件首次启用或配置发生变化时影响旧提示词缓存。
-
-## 平台限制
-
-主动消息依赖平台适配器对 `Context.send_message()` 的支持。部分平台可能禁止或限制主动消息；QQ 官方 API 适配器目前不支持该接口。NapCat/OneBot 等平台也可能受账号风控、频率限制或平台规则影响，请优先使用测试账号并控制发送频率。
+| `daily_limit` | `3` | 每个会话每日主动评估上限 |
+| `decision_prompt` | 内置模板 | 当前轮的时间决策规则，注入 system prompt |
+| `wake_prompt` | 内置模板 | 时间到达后交给主动 Agent 的任务指令 |
+| `debug_full_payload` | `false` | 临时记录续聊提示词与模型响应 |
 
 ## 日志诊断
 
-插件的运行日志统一以 `[smart_followup]` 开头，覆盖以下完整链路：
+运行日志统一以 `[smart_followup]` 开头，覆盖用户活动、旧任务取消、决策解析、本地等待任务创建、唤醒事件入队和异常。每次请求还会记录 `request_kind` 与 `system_prompt_sha256`；普通请求和唤醒请求的哈希应相同，可以直接用来确认 system prompt 未变化。`debug_full_payload` 只应在排查时开启；它会记录完整 system prompt、本轮用户消息、续聊临时数据、模型正文和思考内容，可能包含敏感信息。
 
-当前调试版本默认启用 `debug_full_payload`，会额外打印完整 system prompt、本轮用户 prompt、续聊插件自己的临时提示、模型正文和思考内容。历史对话、其他插件召回内容、消息链及 Provider 原始对象只记录数量或不记录。日志仍可能包含敏感数据，请仅在本地排查时开启，问题定位后立即关闭。
+## 版本要求
 
-1. 插件加载和持久化任务恢复
-2. 收到用户消息并取消旧定时任务
-3. 向 LLM 请求注入续聊协议
-4. 模型选择不续聊、缺少控制块或生成调度决策
-5. 回复发送完成后持久化并启动定时器
-6. 定时器取消、过期、达到每日上限或主动消息发送结果
+本插件使用 AstrBot 4.26 的消息事件与临时内容能力，要求 AstrBot `>=4.26,<5`。
 
-如果一条消息后只看到 `Model chose no proactive follow-up`，说明模型主动判断本轮不应续聊；如果看不到任何 `[smart_followup]` 日志，则应先确认插件是否已在当前 AstrBot 实例中加载。
+相关官方文档：
 
-## 开发
-
-本插件要求 AstrBot `>=4.24,<5`，遵循官方插件开发指南：
-
-- [最小插件实例](https://docs.astrbot.app/dev/star/guides/simple.html)
 - [AstrBot 插件开发指南](https://docs.astrbot.app/dev/star/plugin-new.html)
 - [消息事件与 LLM 钩子](https://docs.astrbot.app/dev/star/guides/listen-message-event.html)
-- [主动消息发送](https://docs.astrbot.app/dev/star/guides/send-message.html)
 - [插件配置](https://docs.astrbot.app/dev/star/guides/plugin-config.html)
 - [插件存储](https://docs.astrbot.app/dev/star/guides/storage.html)

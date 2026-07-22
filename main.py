@@ -1,32 +1,67 @@
 import asyncio
-import json
+import hashlib
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
+from astrbot.core.cron.events import CronMessageEvent
+from astrbot.core.platform.message_session import MessageSession
 
 PROMPT_MARKER_START = "<!-- smart_followup_prompt:start -->"
 PROMPT_MARKER_END = "<!-- smart_followup_prompt:end -->"
-COMPACT_TAG_PREFIX = "<<SMART_FOLLOWUP|"
-COMPACT_TAG_END = ">>"
-CONTROL_TAG_START = "<astrbot_smart_followup>"
-CONTROL_TAG_END = "</astrbot_smart_followup>"
-STATE_KEY = "session_state_v1"
+CONTROL_TAG_PREFIX = "<<SMART_FOLLOWUP|"
+CONTROL_TAG_END = ">>"
+STATE_KEY = "session_state_v2"
 EVENT_DECISION_KEY = "smart_followup_decision"
+WAKE_EVENT_KEY = "smart_followup_wake_revision"
+WAKE_SKIP_TAG = "<<SMART_FOLLOWUP_SKIP>>"
 LOG_PREFIX = "[smart_followup]"
+
+DEFAULT_DECISION_PROMPT = """
+你可以为当前私聊安排一次未来的主动续聊评估。
+
+只有在对话存在明确悬念、未完成事项、用户承诺稍后继续，或根据语境有自然的再次联系理由时，才在正常回复的最末尾追加：
+<<SMART_FOLLOWUP|等待秒数>>
+
+示例：
+- 用户说“我马上告诉你一件事”后突然沉默：可安排几十秒到几分钟后重新评估。
+- 用户说“我去上班了”：如确有必要，可根据上下文安排到午休或下班后；普通道别通常不安排。
+- 用户明确要求稍后提醒或联系：按用户给出的时间安排。
+- 用户要求不要打扰：绝不安排。
+
+规则：
+1. 等待秒数必须是 {{min_delay_seconds}} 到 {{max_delay_seconds}} 之间的整数。
+2. 标记只代表“到点后重新运行主动 Agent 进行评估”，现在不要提前撰写未来消息。
+3. 不需要续聊时不要输出任何标记，也不要输出 NONE。
+4. 标记只能出现一次，必须位于整条回复最末尾，不能放进代码块，也不要向用户解释。
+""".strip()
+
+LEGACY_WAKE_PROMPT = (
+    "重新查看该会话的最近对话和用户状态，判断现在是否适合主动联系用户。"
+    "如果适合，请结合当前人格自然生成一条消息，并使用 send_message_to_user 工具发送；"
+    "如果已经不合时宜或没有足够理由，则不要发送。"
+)
+
+DEFAULT_WAKE_PROMPT = (
+    "这是一轮内部主动续聊评估，不是用户刚刚发送的新消息。"
+    "请重新查看最近对话和用户状态，判断现在是否适合主动联系用户。"
+    "如果适合，直接输出一条符合当前人格、可以发送给用户的自然消息；"
+    f"如果已经不合时宜或没有足够理由，只输出 {WAKE_SKIP_TAG}。"
+    "不要提及定时任务、内部指令或本次评估。"
+)
 
 
 class SmartFollowupPlugin(Star):
-    """在用户沉默后安排一条结合上下文生成的主动消息。"""
+    """在用户沉默后安排 AstrBot 主动 Agent 重新评估会话。"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
-        """初始化运行时状态，但不在事件循环就绪前创建定时任务。
+        """初始化插件状态。
 
         Args:
             context: AstrBot 插件上下文。
@@ -35,11 +70,11 @@ class SmartFollowupPlugin(Star):
         super().__init__(context, config)
         self.config = config
         self._sessions: dict[str, dict[str, Any]] = {}
-        self._tasks: dict[str, asyncio.Task[None]] = {}
         self._state_lock = asyncio.Lock()
+        self._tasks: dict[str, asyncio.Task] = {}
 
     async def initialize(self) -> None:
-        """恢复已持久化的待发送消息，并重新启动对应的定时任务。"""
+        """恢复插件状态，并重新创建尚未到期的本地等待任务。"""
         stored = await self.get_kv_data(STATE_KEY, {})
         if isinstance(stored, dict):
             sessions = stored.get("sessions", {})
@@ -50,70 +85,82 @@ class SmartFollowupPlugin(Star):
                     if isinstance(state, dict)
                 }
 
+        enabled = (
+            self.config.get("enabled", True)
+            and max(0, int(self.config.get("daily_limit", 3))) > 0
+        )
+        cron_manager = getattr(self.context, "cron_manager", None)
+        pending_tasks = 0
+        state_changed = False
+        for umo, state in self._sessions.items():
+            pending = state.get("pending")
+            if not isinstance(pending, dict):
+                if pending is not None:
+                    state["pending"] = None
+                    state_changed = True
+                continue
+
+            # v0.2 使用核心 Cron 主动 Agent；升级时必须删除，避免旧路径改写
+            # system prompt 并破坏长上下文缓存。
+            job_id = pending.get("job_id")
+            if job_id:
+                if cron_manager:
+                    try:
+                        await cron_manager.delete_job(str(job_id))
+                    except Exception:
+                        logger.exception(
+                            "%s Failed to delete legacy Cron job: job_id=%s",
+                            LOG_PREFIX,
+                            job_id,
+                        )
+                state["pending"] = None
+                state_changed = True
+                continue
+
+            try:
+                run_at = datetime.fromisoformat(str(pending.get("run_at")))
+                revision = int(pending["revision"])
+            except (KeyError, TypeError, ValueError):
+                state["pending"] = None
+                state_changed = True
+                continue
+            if not enabled or run_at.timestamp() <= time.time():
+                state["pending"] = None
+                state_changed = True
+                continue
+
+            self._tasks[umo] = asyncio.create_task(
+                self._wake_after(
+                    umo=umo,
+                    revision=revision,
+                    run_at=run_at,
+                    wake_prompt=str(pending.get("wake_prompt") or DEFAULT_WAKE_PROMPT),
+                    self_id=str(pending.get("self_id") or "astrbot"),
+                )
+            )
+            pending_tasks += 1
+
+        if state_changed:
+            async with self._state_lock:
+                await self._persist_state()
+
         logger.info(
             "%s Plugin initialized: enabled=%s private_only=%s "
-            "delay_range=%s-%ss daily_limit=%s full_payload_debug=%s "
-            "persisted_sessions=%s",
+            "delay_range=%s-%ss daily_limit=%s pending_local_tasks=%s",
             LOG_PREFIX,
             self.config.get("enabled", True),
             self.config.get("private_only", True),
             max(1, int(self.config.get("min_delay_seconds", 30))),
             max(1, int(self.config.get("max_delay_seconds", 86400))),
             max(0, int(self.config.get("daily_limit", 3))),
-            self.config.get("debug_full_payload", True),
-            len(self._sessions),
-        )
-
-        if not self.config.get("enabled", True) or max(
-            0, int(self.config.get("daily_limit", 3))
-        ) == 0:
-            changed = False
-            for state in self._sessions.values():
-                if state.get("pending") is not None:
-                    state["pending"] = None
-                    changed = True
-            if changed:
-                async with self._state_lock:
-                    await self._persist_state()
-            logger.info(
-                "%s Scheduling is disabled; persisted pending jobs were cleared=%s",
-                LOG_PREFIX,
-                changed,
-            )
-            return
-
-        restored_state_changed = False
-        restored_timers = 0
-        for umo, state in list(self._sessions.items()):
-            pending = state.get("pending")
-            if not isinstance(pending, dict):
-                continue
-            if self.config.get("private_only", True) and not state.get(
-                "is_private", False
-            ):
-                state["pending"] = None
-                restored_state_changed = True
-                continue
-            due_at = pending.get("due_at")
-            revision = pending.get("revision")
-            if isinstance(due_at, (int, float)) and isinstance(revision, int):
-                self._start_timer(umo, revision, float(due_at))
-                restored_timers += 1
-        if restored_state_changed:
-            async with self._state_lock:
-                await self._persist_state()
-        logger.info(
-            "%s Restore completed: timers=%s discarded_non_private=%s",
-            LOG_PREFIX,
-            restored_timers,
-            restored_state_changed,
+            pending_tasks,
         )
 
     def _is_eligible(self, event: AstrMessageEvent) -> bool:
-        """判断当前事件是否应启用主动续聊处理。
+        """判断当前消息事件是否启用主动续聊。
 
         Args:
-            event: 收到的 AstrBot 消息事件。
+            event: AstrBot 消息事件。
 
         Returns:
             当前会话需要由插件处理时返回 `True`。
@@ -125,64 +172,32 @@ class SmartFollowupPlugin(Star):
         return not self.config.get("private_only", True) or event.is_private_chat()
 
     async def _persist_state(self) -> None:
-        """持久化当前可序列化为 JSON 的会话状态。
+        """持久化当前会话状态。
 
-        调用方必须先持有 `_state_lock`，避免消息事件与定时任务并发更新时
-        相互覆盖状态。
+        调用方必须先持有 `_state_lock`，避免并发更新互相覆盖。
         """
         await self.put_kv_data(STATE_KEY, {"sessions": self._sessions})
 
-    def _cancel_timer(self, umo: str) -> None:
-        """取消指定会话当前存在的内存定时任务。
+    async def _wake_after(
+        self,
+        *,
+        umo: str,
+        revision: int,
+        run_at: datetime,
+        wake_prompt: str,
+        self_id: str,
+    ) -> None:
+        """等待到期后向普通消息管线投递一次临时评估事件。
 
         Args:
-            umo: 用于标识会话的统一消息来源。
-        """
-        task = self._tasks.pop(umo, None)
-        if task and not task.done():
-            task.cancel()
-
-    def _start_timer(self, umo: str, revision: int, due_at: float) -> None:
-        """用最新决策对应的任务替换当前会话定时器。
-
-        Args:
-            umo: 用于标识会话的统一消息来源。
-            revision: 生成本次调度决策时的用户消息版本号。
-            due_at: 主动消息应发送时的 Unix 时间戳。
-        """
-        self._cancel_timer(umo)
-        self._tasks[umo] = asyncio.create_task(
-            self._wait_and_send(umo, revision, due_at),
-            name="smart-followup-timer",
-        )
-        logger.info(
-            "%s Timer started: session=%s revision=%s due_in=%.1fs",
-            LOG_PREFIX,
-            umo,
-            revision,
-            max(0.0, due_at - time.time()),
-        )
-
-    async def _wait_and_send(self, umo: str, revision: int, due_at: float) -> None:
-        """等待发送时间，丢弃过期任务，并发送已保存的消息。
-
-        Args:
-            umo: 用于标识目标会话的统一消息来源。
-            revision: 用于识别过期任务的预期用户消息版本号。
-            due_at: 消息应发送时的 Unix 时间戳。
+            umo: 原会话的统一消息来源。
+            revision: 安排任务时的会话版本号。
+            run_at: 计划唤醒时间。
+            wake_prompt: 追加在历史末尾的临时用户级指令。
+            self_id: 原平台机器人的账号 ID。
         """
         try:
-            logger.info(
-                "%s Timer waiting: session=%s revision=%s due_at=%s",
-                LOG_PREFIX,
-                umo,
-                revision,
-                datetime.fromtimestamp(due_at).astimezone().isoformat(
-                    timespec="seconds"
-                ),
-            )
-            await asyncio.sleep(max(0.0, due_at - time.time()))
-
+            await asyncio.sleep(max(0, run_at.timestamp() - time.time()))
             async with self._state_lock:
                 state = self._sessions.get(umo)
                 pending = state.get("pending") if state else None
@@ -191,83 +206,38 @@ class SmartFollowupPlugin(Star):
                     or state.get("revision") != revision
                     or not isinstance(pending, dict)
                     or pending.get("revision") != revision
-                    or float(pending.get("due_at", -1)) != due_at
                 ):
-                    logger.info(
-                        "%s Stale timer discarded: session=%s revision=%s",
-                        LOG_PREFIX,
-                        umo,
-                        revision,
-                    )
                     return
-
-                today = datetime.now().astimezone().date().isoformat()
-                if state.get("daily_date") != today:
-                    state["daily_date"] = today
-                    state["daily_count"] = 0
-                if int(state.get("daily_count", 0)) >= max(
-                    0, int(self.config.get("daily_limit", 3))
-                ):
-                    state["pending"] = None
-                    await self._persist_state()
-                    logger.info(
-                        "%s Daily limit reached; pending message discarded: "
-                        "session=%s count=%s",
-                        LOG_PREFIX,
-                        umo,
-                        state.get("daily_count", 0),
-                    )
-                    return
-
-                message = str(pending.get("message", "")).strip()
                 state["pending"] = None
+                state["updated_at"] = time.time()
                 await self._persist_state()
+                self._tasks.pop(umo, None)
 
-            if not message:
-                logger.warning(
-                    "%s Empty proactive message discarded: session=%s",
-                    LOG_PREFIX,
-                    umo,
-                )
-                return
-
-            logger.info(
-                "%s Timer due; sending proactive message: session=%s length=%s",
-                LOG_PREFIX,
-                umo,
-                len(message),
+            session = MessageSession.from_str(umo)
+            wake_event = CronMessageEvent(
+                context=self.context,
+                session=session,
+                message=wake_prompt,
+                sender_id=self_id,
+                sender_name="Smart Follow-up",
+                message_type=session.message_type,
             )
-            sent = await self.context.send_message(umo, MessageChain().message(message))
-            if not sent:
-                logger.warning(
-                    "%s Platform does not support proactive send: session=%s",
-                    LOG_PREFIX,
-                    umo,
-                )
-                return
-
-            async with self._state_lock:
-                state = self._sessions.get(umo)
-                if state:
-                    today = datetime.now().astimezone().date().isoformat()
-                    if state.get("daily_date") != today:
-                        state["daily_date"] = today
-                        state["daily_count"] = 0
-                    state["daily_count"] = int(state.get("daily_count", 0)) + 1
-                    state["last_proactive"] = {
-                        "revision": revision,
-                        "sent_at": time.time(),
-                        "message": message,
-                    }
-                    await self._persist_state()
+            platform = self.context.get_platform_inst(session.platform_id)
+            if platform:
+                # 保持平台能力和工具集合与普通对话一致，避免请求结构发生变化。
+                wake_event.platform_meta = platform.meta()
+            wake_event.set_extra(WAKE_EVENT_KEY, revision)
+            wake_event.set_extra("enable_streaming", False)
+            self.context.get_event_queue().put_nowait(wake_event)
             logger.info(
-                "%s Proactive message sent successfully: session=%s",
+                "%s Cache-preserving wake event queued: session=%s revision=%s",
                 LOG_PREFIX,
                 umo,
+                revision,
             )
         except asyncio.CancelledError:
             logger.info(
-                "%s Timer cancelled: session=%s revision=%s",
+                "%s Local wake task cancelled: session=%s revision=%s",
                 LOG_PREFIX,
                 umo,
                 revision,
@@ -275,34 +245,32 @@ class SmartFollowupPlugin(Star):
             raise
         except Exception:
             logger.exception(
-                "%s Failed to send proactive message: session=%s revision=%s",
+                "%s Failed to queue local wake event: session=%s revision=%s",
                 LOG_PREFIX,
                 umo,
                 revision,
             )
         finally:
-            current_task = asyncio.current_task()
-            if self._tasks.get(umo) is current_task:
+            if self._tasks.get(umo) is asyncio.current_task():
                 self._tasks.pop(umo, None)
 
-    def _extract_decision(self, text: str) -> tuple[str, dict[str, Any] | None]:
-        """移除控制块，并校验模型给出的调度决策。
+    def _extract_decision(self, text: str) -> tuple[str, dict[str, int] | None]:
+        """清理控制标记并解析等待秒数。
 
         Args:
             text: LLM 返回的完整文本。
 
         Returns:
-            包含用户可见文本和已校验决策的二元组。模型选择不续聊或输出
-            无效元数据时，决策为 `None`。
+            用户可见文本和已校验调度决策组成的二元组。没有调度时决策为
+            `None`。
         """
         compact_pattern = re.compile(
-            rf"{re.escape(COMPACT_TAG_PREFIX)}([\s\S]*?){re.escape(COMPACT_TAG_END)}"
+            rf"{re.escape(CONTROL_TAG_PREFIX)}([\s\S]*?){re.escape(CONTROL_TAG_END)}"
         )
         legacy_pattern = re.compile(
-            rf"{re.escape(CONTROL_TAG_START)}([\s\S]*?){re.escape(CONTROL_TAG_END)}"
+            r"<astrbot_smart_followup>[\s\S]*?</astrbot_smart_followup>"
         )
         compact_matches = list(compact_pattern.finditer(text or ""))
-        legacy_matches = list(legacy_pattern.finditer(text or ""))
         fenced_compact_pattern = re.compile(
             rf"```(?:json|text)?\s*{compact_pattern.pattern}\s*```",
             re.IGNORECASE,
@@ -316,88 +284,93 @@ class SmartFollowupPlugin(Star):
         clean_text = compact_pattern.sub("", clean_text)
         clean_text = legacy_pattern.sub("", clean_text)
 
-        # 即使末尾控制块格式损坏，也不能让它泄漏到用户可见回复中。
-        if COMPACT_TAG_PREFIX in clean_text:
-            clean_text = clean_text.split(COMPACT_TAG_PREFIX, 1)[0]
-        if CONTROL_TAG_START in clean_text:
-            clean_text = clean_text.split(CONTROL_TAG_START, 1)[0]
-        clean_text = clean_text.replace(CONTROL_TAG_END, "").strip()
-        if not compact_matches and not legacy_matches:
+        # 格式损坏的尾部标记也不能泄漏给用户。
+        if CONTROL_TAG_PREFIX in clean_text:
+            clean_text = clean_text.split(CONTROL_TAG_PREFIX, 1)[0]
+        clean_text = clean_text.strip()
+        if not compact_matches:
             return clean_text, None
 
-        if compact_matches:
-            compact_payload = compact_matches[-1].group(1).strip()
-            if compact_payload.upper() == "NONE":
-                return clean_text, None
-            compact_parts = compact_payload.split("|", 1)
-            if len(compact_parts) != 2:
-                logger.warning("%s Ignored malformed compact control tag", LOG_PREFIX)
-                return clean_text, None
-            try:
-                after_seconds: int | float = int(compact_parts[0].strip())
-            except ValueError:
-                logger.warning("%s Ignored malformed compact control tag", LOG_PREFIX)
-                return clean_text, None
-            message: Any = compact_parts[1].strip()
-        else:
-            raw_payload = legacy_matches[-1].group(1).strip()
-            if raw_payload.startswith("```json"):
-                raw_payload = raw_payload[7:]
-            elif raw_payload.startswith("```"):
-                raw_payload = raw_payload[3:]
-            if raw_payload.endswith("```"):
-                raw_payload = raw_payload[:-3]
-
-            try:
-                payload = json.loads(raw_payload.strip())
-            except (json.JSONDecodeError, TypeError):
-                logger.warning("%s Ignored malformed model control block", LOG_PREFIX)
-                return clean_text, None
-
-            if not isinstance(payload, dict) or payload.get("action") != "schedule":
-                return clean_text, None
-
-            after_seconds = payload.get("after_seconds")
-            message = payload.get("message")
-        if (
-            isinstance(after_seconds, bool)
-            or not isinstance(after_seconds, (int, float))
-            or not isinstance(message, str)
-            or not message.strip()
-        ):
+        payload = compact_matches[-1].group(1).strip()
+        try:
+            after_seconds = int(payload)
+        except ValueError:
+            logger.warning("%s Ignored malformed follow-up marker", LOG_PREFIX)
             return clean_text, None
-
         minimum = max(1, int(self.config.get("min_delay_seconds", 30)))
         maximum = max(minimum, int(self.config.get("max_delay_seconds", 86400)))
-        delay = min(maximum, max(minimum, int(after_seconds)))
-        max_length = max(1, int(self.config.get("max_message_length", 300)))
         return clean_text, {
-            "action": "schedule",
-            "after_seconds": delay,
-            "message": message.strip()[:max_length],
+            "after_seconds": min(maximum, max(minimum, int(after_seconds)))
         }
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100000)
     async def record_user_activity(self, event: AstrMessageEvent) -> None:
-        """使旧定时任务失效，并更新近期用户活跃度统计。
+        """记录用户活动，并取消当前会话的旧等待任务。
 
         Args:
             event: 新收到的用户消息事件。
         """
-        if not self._is_eligible(event):
-            logger.debug(
-                "%s Incoming message skipped: session=%s private=%s enabled=%s",
+        wake_revision = event.get_extra(WAKE_EVENT_KEY)
+        if isinstance(wake_revision, int):
+            if not self._is_eligible(event):
+                event.stop_event()
+                return
+            async with self._state_lock:
+                current_revision = int(
+                    self._sessions.get(event.unified_msg_origin, {}).get("revision", -1)
+                )
+            if current_revision != wake_revision:
+                event.stop_event()
+                logger.info(
+                    "%s Stale wake event stopped before pipeline: session=%s "
+                    "scheduled_revision=%s current_revision=%s",
+                    LOG_PREFIX,
+                    event.unified_msg_origin,
+                    wake_revision,
+                    current_revision,
+                )
+                return
+            event.set_extra("enable_streaming", False)
+            logger.info(
+                "%s Wake event entered normal message pipeline: session=%s revision=%s",
                 LOG_PREFIX,
                 event.unified_msg_origin,
-                event.is_private_chat(),
-                self.config.get("enabled", True),
+                wake_revision,
             )
             return
 
+        if not self._is_eligible(event):
+            return
+
         umo = event.unified_msg_origin
-        timer_cancelled = umo in self._tasks and not self._tasks[umo].done()
-        self._cancel_timer(umo)
         now = time.time()
+        async with self._state_lock:
+            current_state = self._sessions.get(umo, {})
+            pending = current_state.get("pending")
+            pending_run_at = (
+                pending.get("run_at") if isinstance(pending, dict) else None
+            )
+
+        pending_is_waiting = isinstance(pending, dict)
+        if pending_is_waiting and pending_run_at:
+            try:
+                pending_is_waiting = (
+                    datetime.fromisoformat(str(pending_run_at)).timestamp() > now
+                )
+            except ValueError:
+                pending_is_waiting = True
+
+        cancelled_task = False
+        task = self._tasks.pop(umo, None)
+        if task and not task.done():
+            task.cancel()
+            cancelled_task = True
+            logger.info(
+                "%s Pending local wake cancelled by new user message: session=%s",
+                LOG_PREFIX,
+                umo,
+            )
+
         async with self._state_lock:
             state = self._sessions.setdefault(
                 umo,
@@ -408,7 +381,6 @@ class SmartFollowupPlugin(Star):
                     "pending": None,
                     "daily_date": "",
                     "daily_count": 0,
-                    "last_proactive": None,
                     "is_private": event.is_private_chat(),
                 },
             )
@@ -424,62 +396,66 @@ class SmartFollowupPlugin(Star):
             state["pending"] = None
             state["updated_at"] = now
             state["is_private"] = event.is_private_chat()
+            today = datetime.now().astimezone().date().isoformat()
+            if pending_is_waiting and state.get("daily_date") == today:
+                state["daily_count"] = max(0, int(state.get("daily_count", 0)) - 1)
             await self._persist_state()
-
-            logger.info(
-                "%s User activity recorded: session=%s revision=%s "
-                "old_timer_cancelled=%s recent_intervals=%s",
-                LOG_PREFIX,
-                umo,
-                state["revision"],
-                timer_cancelled,
-                state["recent_intervals"],
-            )
+            revision = state["revision"]
+            recent_intervals = state["recent_intervals"]
 
         if self.config.get("disable_streaming", True):
             event.set_extra("enable_streaming", False)
-            logger.debug(
-                "%s Streaming disabled for control-tag safety: session=%s",
-                LOG_PREFIX,
-                umo,
-            )
+        logger.info(
+            "%s User activity recorded: session=%s revision=%s "
+            "cancelled_local_task=%s recent_intervals=%s",
+            LOG_PREFIX,
+            umo,
+            revision,
+            cancelled_task,
+            recent_intervals,
+        )
 
-    # 最后修改 LLM 请求，避免其他插件随后重建 system prompt 或在其后追加指令。
+    # 最后修改请求，避免后续插件覆盖稳定规则或在动态上下文之后追加内容。
     @filter.on_llm_request(priority=-100000)
     async def inject_followup_protocol(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
-        """注入稳定协议规则和仅用于本轮的临时活跃度上下文。
+        """向 system prompt 注入稳定规则，并追加临时运行数据。
 
         Args:
             event: 当前消息事件。
-            req: 即将发送给 LLM、允许插件修改的请求对象。
+            req: 即将发送给 LLM 的可变请求对象。
         """
         if not self._is_eligible(event):
             return
 
+        wake_revision = event.get_extra(WAKE_EVENT_KEY)
+        if isinstance(wake_revision, int):
+            async with self._state_lock:
+                current_revision = int(
+                    self._sessions.get(event.unified_msg_origin, {}).get("revision", -1)
+                )
+            if current_revision != wake_revision:
+                event.stop_event()
+                logger.info(
+                    "%s Stale wake event stopped before LLM request: session=%s "
+                    "scheduled_revision=%s current_revision=%s",
+                    LOG_PREFIX,
+                    event.unified_msg_origin,
+                    wake_revision,
+                    current_revision,
+                )
+                return
+
         minimum = max(1, int(self.config.get("min_delay_seconds", 30)))
         maximum = max(minimum, int(self.config.get("max_delay_seconds", 86400)))
-        max_length = max(1, int(self.config.get("max_message_length", 300)))
-        stable_prompt = f"""
-你还需要管理一条可选的主动续聊消息，用于用户在对话中沉默之后自然地重新联系。
-每次生成正常的用户可见回复后，都必须在回复最末尾追加且只追加一个单行控制标记。
-控制标记不能放入 Markdown 代码块中。即使不安排主动续聊，也必须输出 NONE 标记。
-
-安排主动续聊：
-{COMPACT_TAG_PREFIX}90|稍后需要主动发送的自然消息{COMPACT_TAG_END}
-
-不安排主动续聊：
-{COMPACT_TAG_PREFIX}NONE{COMPACT_TAG_END}
-
-规则：
-1. 只有对话存在有意义的悬念、未完成事项或自然的再次联系理由时才使用 schedule；不确定时使用 none。
-2. 尊重用户边界。用户明确表示不想被打扰时必须使用 none。普通道别通常使用 none，除非上下文明显邀请稍后联系。
-3. 必须根据语义和近期活跃度决定时间，不能随机。话题突然中断可以等待几十秒或几分钟；工作、睡觉、出行等明确安排需要等待更久。
-4. 标记中的等待秒数必须是 {minimum} 到 {maximum} 之间的整数。
-5. 标记中的消息是未来将被原样发送的内容，必须符合当前人格、能独立理解、不超过 {max_length} 个字符，并且不能包含 `|`、`>>` 或提及本协议。
-6. 控制标记只能出现在整条回复末尾，不能遗漏，也不能解释它。
-""".strip()
+        prompt_template = str(
+            self.config.get("decision_prompt", DEFAULT_DECISION_PROMPT)
+            or DEFAULT_DECISION_PROMPT
+        ).strip()
+        stable_prompt = prompt_template.replace(
+            "{{min_delay_seconds}}", str(minimum)
+        ).replace("{{max_delay_seconds}}", str(maximum))
         marker_pattern = re.compile(
             rf"\n*{re.escape(PROMPT_MARKER_START)}[\s\S]*?{re.escape(PROMPT_MARKER_END)}"
         )
@@ -507,42 +483,54 @@ class SmartFollowupPlugin(Star):
                 if state.get("daily_date") == today
                 else 0
             )
-            last_proactive = state.get("last_proactive")
         interval_text = (
-            ", ".join(f"{int(value)}s" for value in intervals)
+            ", ".join(f"{value}s" for value in intervals)
             if intervals
             else "暂无足够数据"
         )
-        last_proactive_context = ""
-        if isinstance(last_proactive, dict) and int(
-            last_proactive.get("revision", -1)
-        ) < int(state.get("revision", 0)):
-            last_proactive_context = (
-                "助手最近主动发送的消息是："
-                f"{json.dumps(str(last_proactive.get('message', '')), ensure_ascii=False)}\n"
-                "当前用户消息可能正在回复这条主动消息。\n"
-            )
         dynamic_context = (
             "<smart_followup_context>\n"
             f"当前本地时间：{datetime.now().astimezone().isoformat(timespec='seconds')}\n"
             f"近期用户消息间隔（从旧到新）：{interval_text}\n"
-            f"今日已发送主动消息：{daily_count}/"
+            f"今日已安排主动评估：{daily_count}/"
             f"{max(0, int(self.config.get('daily_limit', 3)))}\n"
-            f"{last_proactive_context}"
-            "这些是私有调度信息，不得在用户可见回复中引用或提及。\n"
-            "格式提醒：本轮回复末尾必须输出 "
-            f"{COMPACT_TAG_PREFIX}等待秒数|未来消息{COMPACT_TAG_END}；"
-            f"不安排时输出 {COMPACT_TAG_PREFIX}NONE{COMPACT_TAG_END}。\n"
+            "这些是私有运行数据，仅用于 system prompt 中的主动续聊决策。\n"
             "</smart_followup_context>"
         )
-        req.extra_user_content_parts.append(
-            TextPart(text=dynamic_context).mark_as_temp()
-        )
-        if self.config.get("debug_full_payload", True):
+        if isinstance(wake_revision, int):
+            # 唤醒指令作为历史末尾的临时 user 消息参与推理。system prompt、历史
+            # 前缀和平台工具结构均与普通对话保持一致。
+            temporary_parts: list[dict[str, Any]] = []
+            if req.prompt:
+                temporary_parts.append({"type": "text", "text": req.prompt})
+            for part in req.extra_user_content_parts:
+                if hasattr(part, "model_dump_for_context"):
+                    part_data = part.model_dump_for_context()
+                elif isinstance(part, dict):
+                    part_data = dict(part)
+                else:
+                    continue
+                part_data.pop("_no_save", None)
+                temporary_parts.append(part_data)
+            temporary_parts.append({"type": "text", "text": dynamic_context})
+            req.contexts.append(
+                {
+                    "role": "user",
+                    "content": temporary_parts,
+                    "_no_save": True,
+                }
+            )
+            req.prompt = None
+            req.extra_user_content_parts.clear()
+        else:
+            req.extra_user_content_parts.append(
+                TextPart(text=dynamic_context).mark_as_temp()
+            )
+
+        if self.config.get("debug_full_payload", False):
             logger.info(
                 "%s ===== SMART FOLLOWUP LLM REQUEST =====\n"
                 "session=%s\n"
-                "model=%s\n"
                 "----- SYSTEM PROMPT -----\n%s\n"
                 "----- USER PROMPT -----\n%s\n"
                 "----- SMART FOLLOWUP TEMPORARY CONTEXT -----\n%s\n"
@@ -550,7 +538,6 @@ class SmartFollowupPlugin(Star):
                 "===== SMART FOLLOWUP LLM REQUEST END =====",
                 LOG_PREFIX,
                 event.unified_msg_origin,
-                req.model,
                 req.system_prompt,
                 req.prompt,
                 dynamic_context,
@@ -558,31 +545,33 @@ class SmartFollowupPlugin(Star):
                 len(req.extra_user_content_parts),
             )
         logger.info(
-            "%s LLM protocol injected as final request hook: session=%s "
-            "revision=%s intervals=%s daily_count=%s bridged_proactive=%s "
-            "system_prompt_length=%s extra_parts=%s",
+            "%s Follow-up decision protocol injected: session=%s revision=%s "
+            "request_kind=%s intervals=%s daily_count=%s system_prompt_length=%s "
+            "system_prompt_sha256=%s",
             LOG_PREFIX,
             event.unified_msg_origin,
             state.get("revision", 0),
+            "wake" if isinstance(wake_revision, int) else "normal",
             intervals,
             daily_count,
-            bool(last_proactive_context),
             len(req.system_prompt),
-            len(req.extra_user_content_parts),
+            hashlib.sha256(req.system_prompt.encode("utf-8")).hexdigest()[:16],
         )
 
     @filter.on_llm_response(priority=100000)
     async def parse_followup_decision(
         self, event: AstrMessageEvent, response: LLMResponse
     ) -> None:
-        """清理模型控制元数据，并把已校验的决策附加到事件。
+        """清理模型标记，并把等待时间附加到当前事件。
 
         Args:
             event: 当前消息事件。
-            response: 包含最终生成文本、允许插件修改的 LLM 响应。
+            response: 当前 LLM 响应。
         """
-        eligible = self._is_eligible(event)
-        if eligible and self.config.get("debug_full_payload", True):
+        if not self._is_eligible(event) or not response.completion_text:
+            return
+
+        if self.config.get("debug_full_payload", False):
             logger.info(
                 "%s ===== SMART FOLLOWUP LLM RESPONSE =====\n"
                 "session=%s\n"
@@ -595,63 +584,57 @@ class SmartFollowupPlugin(Star):
                 response.reasoning_content,
             )
 
-        if not eligible or not response.completion_text:
-            if eligible:
-                logger.warning(
-                    "%s Empty LLM response; no follow-up decision available: session=%s",
-                    LOG_PREFIX,
-                    event.unified_msg_origin,
-                )
+        if isinstance(event.get_extra(WAKE_EVENT_KEY), int):
+            clean_text, _ = self._extract_decision(response.completion_text)
+            should_skip = WAKE_SKIP_TAG in clean_text
+            response.completion_text = (
+                "" if should_skip else clean_text.replace(WAKE_SKIP_TAG, "").strip()
+            )
+            if response.reasoning_content:
+                clean_reasoning, _ = self._extract_decision(response.reasoning_content)
+                response.reasoning_content = clean_reasoning.replace(
+                    WAKE_SKIP_TAG, ""
+                ).strip()
+            event.set_extra(EVENT_DECISION_KEY, None)
+            logger.info(
+                "%s Wake evaluation completed: session=%s send=%s response_length=%s",
+                LOG_PREFIX,
+                event.unified_msg_origin,
+                not should_skip and bool(response.completion_text),
+                len(response.completion_text),
+            )
             return
 
-        had_control_block = (
-            COMPACT_TAG_PREFIX in response.completion_text
-            and COMPACT_TAG_END in response.completion_text
-        ) or (
-            CONTROL_TAG_START in response.completion_text
+        had_control_marker = (
+            CONTROL_TAG_PREFIX in response.completion_text
             and CONTROL_TAG_END in response.completion_text
         )
         clean_text, decision = self._extract_decision(response.completion_text)
         response.completion_text = clean_text
-        decision_from_reasoning = False
-        if not had_control_block and response.reasoning_content:
-            reasoning_had_control_block = (
-                COMPACT_TAG_PREFIX in response.reasoning_content
-                and COMPACT_TAG_END in response.reasoning_content
-            ) or (
-                CONTROL_TAG_START in response.reasoning_content
+        decision_source = "completion"
+        if not had_control_marker and response.reasoning_content:
+            reasoning_had_marker = (
+                CONTROL_TAG_PREFIX in response.reasoning_content
                 and CONTROL_TAG_END in response.reasoning_content
             )
             clean_reasoning, reasoning_decision = self._extract_decision(
                 response.reasoning_content
             )
             response.reasoning_content = clean_reasoning
-            if reasoning_had_control_block:
-                had_control_block = True
+            if reasoning_had_marker:
+                had_control_marker = True
                 decision = reasoning_decision
-                decision_from_reasoning = reasoning_decision is not None
-                logger.info(
-                    "%s Control tag recovered from reasoning content: session=%s "
-                    "scheduled=%s",
-                    LOG_PREFIX,
-                    event.unified_msg_origin,
-                    decision_from_reasoning,
-                )
+                decision_source = "reasoning"
+
         if not decision:
             event.set_extra(EVENT_DECISION_KEY, None)
-            if had_control_block:
-                logger.info(
-                    "%s Model chose no proactive follow-up: session=%s",
-                    LOG_PREFIX,
-                    event.unified_msg_origin,
-                )
-            else:
-                logger.warning(
-                    "%s Model returned no valid control block; no follow-up scheduled: "
-                    "session=%s",
-                    LOG_PREFIX,
-                    event.unified_msg_origin,
-                )
+            logger.info(
+                "%s No future active-agent evaluation requested: session=%s "
+                "marker_present=%s",
+                LOG_PREFIX,
+                event.unified_msg_origin,
+                had_control_marker,
+            )
             return
 
         async with self._state_lock:
@@ -665,8 +648,7 @@ class SmartFollowupPlugin(Star):
             if daily_count >= max(0, int(self.config.get("daily_limit", 3))):
                 event.set_extra(EVENT_DECISION_KEY, None)
                 logger.info(
-                    "%s Model scheduled a follow-up but the daily limit was reached: "
-                    "session=%s count=%s",
+                    "%s Daily evaluation limit reached: session=%s count=%s",
                     LOG_PREFIX,
                     event.unified_msg_origin,
                     daily_count,
@@ -675,99 +657,101 @@ class SmartFollowupPlugin(Star):
             decision["revision"] = int(state.get("revision", 0))
         event.set_extra(EVENT_DECISION_KEY, decision)
         logger.info(
-            "%s Model scheduled a proactive follow-up: session=%s revision=%s "
-            "delay=%ss message_length=%s source=%s",
+            "%s Future active-agent evaluation selected: session=%s "
+            "revision=%s delay=%ss source=%s",
             LOG_PREFIX,
             event.unified_msg_origin,
             decision["revision"],
             decision["after_seconds"],
-            len(decision["message"]),
-            "reasoning" if decision_from_reasoning else "completion",
+            decision_source,
         )
 
     @filter.after_message_sent(priority=100000)
     async def schedule_after_reply(self, event: AstrMessageEvent) -> None:
-        """仅在当前回复发送成功后持久化决策并启动定时任务。
+        """在当前回复发送后创建一次性本地等待任务。
 
         Args:
-            event: 回复刚刚发送完成的消息事件。
+            event: 回复已经发送完成的消息事件。
         """
         decision = event.get_extra(EVENT_DECISION_KEY)
         event.set_extra(EVENT_DECISION_KEY, None)
-        if not self._is_eligible(event):
-            return
-
-        umo = event.unified_msg_origin
-        async with self._state_lock:
-            state = self._sessions.get(umo)
-            last_proactive = state.get("last_proactive") if state else None
-            if (
-                state
-                and isinstance(last_proactive, dict)
-                and int(last_proactive.get("revision", -1))
-                < int(state.get("revision", 0))
-            ):
-                state["last_proactive"] = None
-                await self._persist_state()
-
-        if not isinstance(decision, dict):
-            logger.info(
-                "%s Reply sent with no pending proactive follow-up: session=%s",
-                LOG_PREFIX,
-                umo,
-            )
+        if not self._is_eligible(event) or not isinstance(decision, dict):
             return
 
         revision = decision.get("revision")
-        if not isinstance(revision, int):
-            logger.warning(
-                "%s Invalid follow-up revision discarded: session=%s",
-                LOG_PREFIX,
-                umo,
-            )
+        after_seconds = decision.get("after_seconds")
+        if not isinstance(revision, int) or not isinstance(after_seconds, int):
             return
-        due_at = time.time() + int(decision["after_seconds"])
+
+        umo = event.unified_msg_origin
+        run_at = datetime.now().astimezone() + timedelta(seconds=after_seconds)
+        wake_prompt = str(
+            self.config.get("wake_prompt", DEFAULT_WAKE_PROMPT) or DEFAULT_WAKE_PROMPT
+        ).strip()
+        if wake_prompt == LEGACY_WAKE_PROMPT:
+            wake_prompt = DEFAULT_WAKE_PROMPT
+        self_id = event.get_self_id() or "astrbot"
 
         async with self._state_lock:
             state = self._sessions.get(umo)
             if not state or state.get("revision") != revision:
                 logger.info(
                     "%s Follow-up decision became stale before scheduling: "
-                    "session=%s decision_revision=%s current_revision=%s",
+                    "session=%s revision=%s",
                     LOG_PREFIX,
                     umo,
                     revision,
-                    state.get("revision") if state else None,
                 )
                 return
+            today = datetime.now().astimezone().date().isoformat()
+            if state.get("daily_date") != today:
+                state["daily_date"] = today
+                state["daily_count"] = 0
+            state["daily_count"] = int(state.get("daily_count", 0)) + 1
             state["pending"] = {
                 "revision": revision,
-                "due_at": due_at,
-                "message": decision["message"],
+                "run_at": run_at.isoformat(),
+                "wake_prompt": wake_prompt,
+                "self_id": self_id,
             }
             state["updated_at"] = time.time()
             await self._persist_state()
+            old_task = self._tasks.pop(umo, None)
+            if old_task and not old_task.done():
+                old_task.cancel()
+            self._tasks[umo] = asyncio.create_task(
+                self._wake_after(
+                    umo=umo,
+                    revision=revision,
+                    run_at=run_at,
+                    wake_prompt=wake_prompt,
+                    self_id=self_id,
+                )
+            )
 
-        self._start_timer(umo, revision, due_at)
         logger.info(
-            "%s Proactive follow-up persisted and scheduled: session=%s "
-            "revision=%s delay=%ss",
+            "%s Cache-preserving wake scheduled: session=%s revision=%s "
+            "delay=%ss run_at=%s",
             LOG_PREFIX,
             umo,
             revision,
-            decision["after_seconds"],
+            after_seconds,
+            run_at.isoformat(timespec="seconds"),
         )
 
     async def terminate(self) -> None:
-        """插件关闭时持久化状态，并取消全部内存定时任务。"""
-        task_count = len(self._tasks)
-        for umo in list(self._tasks):
-            self._cancel_timer(umo)
+        """插件关闭时取消内存任务并保留待恢复的持久化状态。"""
+        tasks = list(self._tasks.values())
+        self._tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         async with self._state_lock:
             await self._persist_state()
         logger.info(
-            "%s Plugin terminated: cancelled_timers=%s persisted_sessions=%s",
+            "%s Plugin terminated: persisted_sessions=%s cancelled_local_tasks=%s",
             LOG_PREFIX,
-            task_count,
             len(self._sessions),
+            len(tasks),
         )
