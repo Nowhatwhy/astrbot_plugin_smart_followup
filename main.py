@@ -52,13 +52,15 @@ class SmartFollowupPlugin(Star):
 
         logger.info(
             "%s Plugin initialized: enabled=%s private_only=%s "
-            "delay_range=%s-%ss daily_limit=%s persisted_sessions=%s",
+            "delay_range=%s-%ss daily_limit=%s full_payload_debug=%s "
+            "persisted_sessions=%s",
             LOG_PREFIX,
             self.config.get("enabled", True),
             self.config.get("private_only", True),
             max(1, int(self.config.get("min_delay_seconds", 30))),
             max(1, int(self.config.get("max_delay_seconds", 86400))),
             max(0, int(self.config.get("daily_limit", 3))),
+            self.config.get("debug_full_payload", True),
             len(self._sessions),
         )
 
@@ -536,6 +538,30 @@ class SmartFollowupPlugin(Star):
         req.extra_user_content_parts.append(
             TextPart(text=dynamic_context).mark_as_temp()
         )
+        if self.config.get("debug_full_payload", True):
+            extra_parts = []
+            for part in req.extra_user_content_parts:
+                if hasattr(part, "model_dump"):
+                    extra_parts.append(part.model_dump())
+                else:
+                    extra_parts.append(repr(part))
+            logger.info(
+                "%s ===== FULL LLM REQUEST BEGIN =====\n"
+                "session=%s\n"
+                "model=%s\n"
+                "----- SYSTEM PROMPT -----\n%s\n"
+                "----- USER PROMPT -----\n%s\n"
+                "----- EXTRA USER CONTENT PARTS -----\n%s\n"
+                "----- CONVERSATION CONTEXTS -----\n%s\n"
+                "===== FULL LLM REQUEST END =====",
+                LOG_PREFIX,
+                event.unified_msg_origin,
+                req.model,
+                req.system_prompt,
+                req.prompt,
+                json.dumps(extra_parts, ensure_ascii=False, indent=2, default=str),
+                json.dumps(req.contexts, ensure_ascii=False, indent=2, default=str),
+            )
         logger.info(
             "%s LLM protocol injected as final request hook: session=%s "
             "revision=%s intervals=%s daily_count=%s bridged_proactive=%s "
@@ -560,8 +586,26 @@ class SmartFollowupPlugin(Star):
             event: 当前消息事件。
             response: 包含最终生成文本、允许插件修改的 LLM 响应。
         """
-        if not self._is_eligible(event) or not response.completion_text:
-            if self._is_eligible(event):
+        eligible = self._is_eligible(event)
+        if eligible and self.config.get("debug_full_payload", True):
+            logger.info(
+                "%s ===== FULL LLM RESPONSE BEGIN =====\n"
+                "session=%s\n"
+                "----- COMPLETION TEXT -----\n%s\n"
+                "----- REASONING CONTENT -----\n%s\n"
+                "----- RESULT CHAIN -----\n%s\n"
+                "----- RAW COMPLETION -----\n%r\n"
+                "===== FULL LLM RESPONSE END =====",
+                LOG_PREFIX,
+                event.unified_msg_origin,
+                response.completion_text,
+                response.reasoning_content,
+                response.result_chain,
+                response.raw_completion,
+            )
+
+        if not eligible or not response.completion_text:
+            if eligible:
                 logger.warning(
                     "%s Empty LLM response; no follow-up decision available: session=%s",
                     LOG_PREFIX,

@@ -45,6 +45,7 @@ git clone https://github.com/Nowhatwhy/astrbot_plugin_smart_followup.git
 | `enabled` | `true` | 启用插件 |
 | `private_only` | `true` | 仅处理私聊 |
 | `disable_streaming` | `true` | 防止控制标签在流式输出中泄漏 |
+| `debug_full_payload` | `true` | 临时记录完整 LLM 请求与响应，排查完成后应关闭 |
 | `min_delay_seconds` | `30` | 最短等待秒数 |
 | `max_delay_seconds` | `86400` | 最长等待秒数 |
 | `daily_limit` | `3` | 每个会话每日主动消息上限 |
@@ -59,6 +60,8 @@ git clone https://github.com/Nowhatwhy/astrbot_plugin_smart_followup.git
 ## 日志诊断
 
 插件的运行日志统一以 `[smart_followup]` 开头，覆盖以下完整链路：
+
+当前调试版本默认启用 `debug_full_payload`，会额外打印完整 system prompt、用户 prompt、额外用户内容、会话上下文、模型正文、思考内容和 Provider 原始响应。日志包含敏感聊天数据，请仅在本地排查时开启，问题定位后立即关闭。
 
 1. 插件加载和持久化任务恢复
 2. 收到用户消息并取消旧定时任务

@@ -112,6 +112,7 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
             "enabled": True,
             "private_only": True,
             "disable_streaming": True,
+            "debug_full_payload": False,
             "daily_limit": 3,
             "min_delay_seconds": 30,
             "max_delay_seconds": 3600,

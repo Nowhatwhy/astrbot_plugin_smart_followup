@@ -17,6 +17,13 @@
     "default": true,
     "hint": "避免模型生成的隐藏调度标签在流式传输时短暂显示给用户。"
   },
+  "debug_full_payload": {
+    "description": "记录完整 LLM 请求与响应",
+    "type": "bool",
+    "default": true,
+    "hint": "调试期间使用。日志将包含系统提示词、用户消息、对话历史、召回记忆、模型回复和思考内容，可能泄露隐私；排查完成后请关闭。",
+    "obvious_hint": true
+  },
   "min_delay_seconds": {
     "description": "最短等待时间（秒）",
     "type": "int",
