@@ -22,7 +22,6 @@ STATE_KEY = "session_state_v2"
 EVENT_DECISION_KEY = "smart_followup_decision"
 WAKE_EVENT_KEY = "smart_followup_wake_revision"
 WAKE_PROMPT_KEY = "smart_followup_wake_prompt"
-WAKE_TRIGGER = "<<SMART_FOLLOWUP_WAKE>>"
 LOG_PREFIX = "[smart_followup]"
 
 # 配置 schema 是管理员可见默认值的唯一来源，避免 Python 与 JSON 各维护一份。
@@ -170,7 +169,7 @@ class SmartFollowupPlugin(Star):
             umo: 原会话的统一消息来源。
             revision: 安排任务时的会话版本号。
             run_at: 计划唤醒时间。
-            wake_prompt: 追加在历史末尾的临时用户级指令。
+            wake_prompt: 供完整消息管线处理、但不保存到历史的唤醒指令。
             self_id: 原平台机器人的账号 ID。
         """
         try:
@@ -194,7 +193,7 @@ class SmartFollowupPlugin(Star):
             wake_event = CronMessageEvent(
                 context=self.context,
                 session=session,
-                message=WAKE_TRIGGER,
+                message=wake_prompt,
                 sender_id=self_id,
                 sender_name="Smart Follow-up",
                 message_type=session.message_type,
@@ -423,13 +422,14 @@ class SmartFollowupPlugin(Star):
         dynamic_context_lines.append("</smart_followup_context>")
         dynamic_context = "\n".join(dynamic_context_lines)
         if isinstance(wake_revision, int):
-            # 唤醒指令作为历史末尾的临时 user 消息参与推理。system prompt、历史
-            # 前缀和平台工具结构均与普通对话保持一致。
+            # 保留记忆召回等前置插件处理过的 prompt，再整体转成不保存的临时
+            # user 消息。system prompt、历史前缀和平台工具结构均与普通对话一致。
             wake_prompt = str(
                 event.get_extra(WAKE_PROMPT_KEY) or DEFAULT_WAKE_PROMPT
             ).strip()
+            processed_wake_prompt = str(req.prompt or wake_prompt).strip()
             temporary_parts: list[dict[str, Any]] = [
-                {"type": "text", "text": wake_prompt}
+                {"type": "text", "text": processed_wake_prompt}
             ]
             for part in req.extra_user_content_parts:
                 if hasattr(part, "model_dump_for_context"):

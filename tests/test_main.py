@@ -13,7 +13,6 @@ from data.plugins.astrbot_plugin_smart_followup.main import (
     SmartFollowupPlugin,
     WAKE_EVENT_KEY,
     WAKE_PROMPT_KEY,
-    WAKE_TRIGGER,
 )
 
 
@@ -335,9 +334,10 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
             stop_event=lambda: None,
         )
         normal_request = ProviderRequest(system_prompt="persona", prompt="用户消息")
+        recalled_wake_prompt = f"{DEFAULT_WAKE_PROMPT}\n\n[召回记忆]用户喜欢奶茶。"
         wake_request = ProviderRequest(
             system_prompt="persona",
-            prompt=WAKE_TRIGGER,
+            prompt=recalled_wake_prompt,
             contexts=[{"role": "assistant", "content": "上一条回复"}],
         )
 
@@ -349,7 +349,7 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wake_request.extra_user_content_parts, [])
         self.assertTrue(wake_request.contexts[-1]["_no_save"])
         self.assertIn(
-            DEFAULT_WAKE_PROMPT,
+            recalled_wake_prompt,
             [part["text"] for part in wake_request.contexts[-1]["content"]],
         )
         self.assertTrue(
@@ -421,7 +421,7 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         wake_event = queued_events[0]
         self.assertEqual(wake_event.unified_msg_origin, umo)
         self.assertEqual(wake_event.platform_meta, metadata)
-        self.assertEqual(wake_event.message_str, WAKE_TRIGGER)
+        self.assertEqual(wake_event.message_str, DEFAULT_WAKE_PROMPT)
         self.assertEqual(wake_event.get_extra(WAKE_EVENT_KEY), 6)
         self.assertEqual(wake_event.get_extra(WAKE_PROMPT_KEY), DEFAULT_WAKE_PROMPT)
         self.assertFalse(wake_event.get_extra("enable_streaming"))
