@@ -56,6 +56,19 @@ git clone https://github.com/Nowhatwhy/astrbot_plugin_smart_followup.git
 
 主动消息依赖平台适配器对 `Context.send_message()` 的支持。部分平台可能禁止或限制主动消息；QQ 官方 API 适配器目前不支持该接口。NapCat/OneBot 等平台也可能受账号风控、频率限制或平台规则影响，请优先使用测试账号并控制发送频率。
 
+## 日志诊断
+
+插件的运行日志统一以 `[smart_followup]` 开头，覆盖以下完整链路：
+
+1. 插件加载和持久化任务恢复
+2. 收到用户消息并取消旧定时任务
+3. 向 LLM 请求注入续聊协议
+4. 模型选择不续聊、缺少控制块或生成调度决策
+5. 回复发送完成后持久化并启动定时器
+6. 定时器取消、过期、达到每日上限或主动消息发送结果
+
+如果一条消息后只看到 `Model chose no proactive follow-up`，说明模型主动判断本轮不应续聊；如果看不到任何 `[smart_followup]` 日志，则应先确认插件是否已在当前 AstrBot 实例中加载。
+
 ## 开发
 
 本插件要求 AstrBot `>=4.24,<5`，遵循官方插件开发指南：

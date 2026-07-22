@@ -17,6 +17,7 @@ CONTROL_TAG_START = "<astrbot_smart_followup>"
 CONTROL_TAG_END = "</astrbot_smart_followup>"
 STATE_KEY = "session_state_v1"
 EVENT_DECISION_KEY = "smart_followup_decision"
+LOG_PREFIX = "[smart_followup]"
 
 
 class SmartFollowupPlugin(Star):
@@ -47,6 +48,18 @@ class SmartFollowupPlugin(Star):
                     if isinstance(state, dict)
                 }
 
+        logger.info(
+            "%s Plugin initialized: enabled=%s private_only=%s "
+            "delay_range=%s-%ss daily_limit=%s persisted_sessions=%s",
+            LOG_PREFIX,
+            self.config.get("enabled", True),
+            self.config.get("private_only", True),
+            max(1, int(self.config.get("min_delay_seconds", 30))),
+            max(1, int(self.config.get("max_delay_seconds", 86400))),
+            max(0, int(self.config.get("daily_limit", 3))),
+            len(self._sessions),
+        )
+
         if not self.config.get("enabled", True) or max(
             0, int(self.config.get("daily_limit", 3))
         ) == 0:
@@ -58,9 +71,15 @@ class SmartFollowupPlugin(Star):
             if changed:
                 async with self._state_lock:
                     await self._persist_state()
+            logger.info(
+                "%s Scheduling is disabled; persisted pending jobs were cleared=%s",
+                LOG_PREFIX,
+                changed,
+            )
             return
 
         restored_state_changed = False
+        restored_timers = 0
         for umo, state in list(self._sessions.items()):
             pending = state.get("pending")
             if not isinstance(pending, dict):
@@ -75,9 +94,16 @@ class SmartFollowupPlugin(Star):
             revision = pending.get("revision")
             if isinstance(due_at, (int, float)) and isinstance(revision, int):
                 self._start_timer(umo, revision, float(due_at))
+                restored_timers += 1
         if restored_state_changed:
             async with self._state_lock:
                 await self._persist_state()
+        logger.info(
+            "%s Restore completed: timers=%s discarded_non_private=%s",
+            LOG_PREFIX,
+            restored_timers,
+            restored_state_changed,
+        )
 
     def _is_eligible(self, event: AstrMessageEvent) -> bool:
         """判断当前事件是否应启用主动续聊处理。
@@ -125,6 +151,13 @@ class SmartFollowupPlugin(Star):
             self._wait_and_send(umo, revision, due_at),
             name="smart-followup-timer",
         )
+        logger.info(
+            "%s Timer started: session=%s revision=%s due_in=%.1fs",
+            LOG_PREFIX,
+            umo,
+            revision,
+            max(0.0, due_at - time.time()),
+        )
 
     async def _wait_and_send(self, umo: str, revision: int, due_at: float) -> None:
         """等待发送时间，丢弃过期任务，并发送已保存的消息。
@@ -135,6 +168,15 @@ class SmartFollowupPlugin(Star):
             due_at: 消息应发送时的 Unix 时间戳。
         """
         try:
+            logger.info(
+                "%s Timer waiting: session=%s revision=%s due_at=%s",
+                LOG_PREFIX,
+                umo,
+                revision,
+                datetime.fromtimestamp(due_at).astimezone().isoformat(
+                    timespec="seconds"
+                ),
+            )
             await asyncio.sleep(max(0.0, due_at - time.time()))
 
             async with self._state_lock:
@@ -147,6 +189,12 @@ class SmartFollowupPlugin(Star):
                     or pending.get("revision") != revision
                     or float(pending.get("due_at", -1)) != due_at
                 ):
+                    logger.info(
+                        "%s Stale timer discarded: session=%s revision=%s",
+                        LOG_PREFIX,
+                        umo,
+                        revision,
+                    )
                     return
 
                 today = datetime.now().astimezone().date().isoformat()
@@ -158,6 +206,13 @@ class SmartFollowupPlugin(Star):
                 ):
                     state["pending"] = None
                     await self._persist_state()
+                    logger.info(
+                        "%s Daily limit reached; pending message discarded: "
+                        "session=%s count=%s",
+                        LOG_PREFIX,
+                        umo,
+                        state.get("daily_count", 0),
+                    )
                     return
 
                 message = str(pending.get("message", "")).strip()
@@ -165,12 +220,24 @@ class SmartFollowupPlugin(Star):
                 await self._persist_state()
 
             if not message:
+                logger.warning(
+                    "%s Empty proactive message discarded: session=%s",
+                    LOG_PREFIX,
+                    umo,
+                )
                 return
 
+            logger.info(
+                "%s Timer due; sending proactive message: session=%s length=%s",
+                LOG_PREFIX,
+                umo,
+                len(message),
+            )
             sent = await self.context.send_message(umo, MessageChain().message(message))
             if not sent:
                 logger.warning(
-                    "[smart_followup] Platform does not support proactive send: %s",
+                    "%s Platform does not support proactive send: session=%s",
+                    LOG_PREFIX,
                     umo,
                 )
                 return
@@ -189,11 +256,26 @@ class SmartFollowupPlugin(Star):
                         "message": message,
                     }
                     await self._persist_state()
-            logger.info("[smart_followup] Proactive message sent: %s", umo)
+            logger.info(
+                "%s Proactive message sent successfully: session=%s",
+                LOG_PREFIX,
+                umo,
+            )
         except asyncio.CancelledError:
+            logger.info(
+                "%s Timer cancelled: session=%s revision=%s",
+                LOG_PREFIX,
+                umo,
+                revision,
+            )
             raise
         except Exception:
-            logger.exception("[smart_followup] Failed to send proactive message")
+            logger.exception(
+                "%s Failed to send proactive message: session=%s revision=%s",
+                LOG_PREFIX,
+                umo,
+                revision,
+            )
         finally:
             current_task = asyncio.current_task()
             if self._tasks.get(umo) is current_task:
@@ -233,7 +315,7 @@ class SmartFollowupPlugin(Star):
         try:
             payload = json.loads(raw_payload.strip())
         except (json.JSONDecodeError, TypeError):
-            logger.warning("[smart_followup] Ignored malformed model control block")
+            logger.warning("%s Ignored malformed model control block", LOG_PREFIX)
             return clean_text, None
 
         if not isinstance(payload, dict) or payload.get("action") != "schedule":
@@ -267,9 +349,17 @@ class SmartFollowupPlugin(Star):
             event: 新收到的用户消息事件。
         """
         if not self._is_eligible(event):
+            logger.debug(
+                "%s Incoming message skipped: session=%s private=%s enabled=%s",
+                LOG_PREFIX,
+                event.unified_msg_origin,
+                event.is_private_chat(),
+                self.config.get("enabled", True),
+            )
             return
 
         umo = event.unified_msg_origin
+        timer_cancelled = umo in self._tasks and not self._tasks[umo].done()
         self._cancel_timer(umo)
         now = time.time()
         async with self._state_lock:
@@ -300,8 +390,23 @@ class SmartFollowupPlugin(Star):
             state["is_private"] = event.is_private_chat()
             await self._persist_state()
 
+            logger.info(
+                "%s User activity recorded: session=%s revision=%s "
+                "old_timer_cancelled=%s recent_intervals=%s",
+                LOG_PREFIX,
+                umo,
+                state["revision"],
+                timer_cancelled,
+                state["recent_intervals"],
+            )
+
         if self.config.get("disable_streaming", True):
             event.set_extra("enable_streaming", False)
+            logger.debug(
+                "%s Streaming disabled for control-tag safety: session=%s",
+                LOG_PREFIX,
+                umo,
+            )
 
     @filter.on_llm_request(priority=100000)
     async def inject_followup_protocol(
@@ -397,6 +502,16 @@ Rules:
         req.extra_user_content_parts.append(
             TextPart(text=dynamic_context).mark_as_temp()
         )
+        logger.info(
+            "%s LLM protocol injected: session=%s revision=%s intervals=%s "
+            "daily_count=%s bridged_proactive=%s",
+            LOG_PREFIX,
+            event.unified_msg_origin,
+            state.get("revision", 0),
+            intervals,
+            daily_count,
+            bool(last_proactive_context),
+        )
 
     @filter.on_llm_response(priority=100000)
     async def parse_followup_decision(
@@ -409,12 +524,35 @@ Rules:
             response: 包含最终生成文本、允许插件修改的 LLM 响应。
         """
         if not self._is_eligible(event) or not response.completion_text:
+            if self._is_eligible(event):
+                logger.warning(
+                    "%s Empty LLM response; no follow-up decision available: session=%s",
+                    LOG_PREFIX,
+                    event.unified_msg_origin,
+                )
             return
 
+        had_control_block = (
+            CONTROL_TAG_START in response.completion_text
+            and CONTROL_TAG_END in response.completion_text
+        )
         clean_text, decision = self._extract_decision(response.completion_text)
         response.completion_text = clean_text
         if not decision:
             event.set_extra(EVENT_DECISION_KEY, None)
+            if had_control_block:
+                logger.info(
+                    "%s Model chose no proactive follow-up: session=%s",
+                    LOG_PREFIX,
+                    event.unified_msg_origin,
+                )
+            else:
+                logger.warning(
+                    "%s Model returned no valid control block; no follow-up scheduled: "
+                    "session=%s",
+                    LOG_PREFIX,
+                    event.unified_msg_origin,
+                )
             return
 
         async with self._state_lock:
@@ -427,9 +565,25 @@ Rules:
             )
             if daily_count >= max(0, int(self.config.get("daily_limit", 3))):
                 event.set_extra(EVENT_DECISION_KEY, None)
+                logger.info(
+                    "%s Model scheduled a follow-up but the daily limit was reached: "
+                    "session=%s count=%s",
+                    LOG_PREFIX,
+                    event.unified_msg_origin,
+                    daily_count,
+                )
                 return
             decision["revision"] = int(state.get("revision", 0))
         event.set_extra(EVENT_DECISION_KEY, decision)
+        logger.info(
+            "%s Model scheduled a proactive follow-up: session=%s revision=%s "
+            "delay=%ss message_length=%s",
+            LOG_PREFIX,
+            event.unified_msg_origin,
+            decision["revision"],
+            decision["after_seconds"],
+            len(decision["message"]),
+        )
 
     @filter.after_message_sent(priority=100000)
     async def schedule_after_reply(self, event: AstrMessageEvent) -> None:
@@ -457,16 +611,34 @@ Rules:
                 await self._persist_state()
 
         if not isinstance(decision, dict):
+            logger.info(
+                "%s Reply sent with no pending proactive follow-up: session=%s",
+                LOG_PREFIX,
+                umo,
+            )
             return
 
         revision = decision.get("revision")
         if not isinstance(revision, int):
+            logger.warning(
+                "%s Invalid follow-up revision discarded: session=%s",
+                LOG_PREFIX,
+                umo,
+            )
             return
         due_at = time.time() + int(decision["after_seconds"])
 
         async with self._state_lock:
             state = self._sessions.get(umo)
             if not state or state.get("revision") != revision:
+                logger.info(
+                    "%s Follow-up decision became stale before scheduling: "
+                    "session=%s decision_revision=%s current_revision=%s",
+                    LOG_PREFIX,
+                    umo,
+                    revision,
+                    state.get("revision") if state else None,
+                )
                 return
             state["pending"] = {
                 "revision": revision,
@@ -478,14 +650,24 @@ Rules:
 
         self._start_timer(umo, revision, due_at)
         logger.info(
-            "[smart_followup] Scheduled proactive message in %ss: %s",
-            decision["after_seconds"],
+            "%s Proactive follow-up persisted and scheduled: session=%s "
+            "revision=%s delay=%ss",
+            LOG_PREFIX,
             umo,
+            revision,
+            decision["after_seconds"],
         )
 
     async def terminate(self) -> None:
         """插件关闭时持久化状态，并取消全部内存定时任务。"""
+        task_count = len(self._tasks)
         for umo in list(self._tasks):
             self._cancel_timer(umo)
         async with self._state_lock:
             await self._persist_state()
+        logger.info(
+            "%s Plugin terminated: cancelled_timers=%s persisted_sessions=%s",
+            LOG_PREFIX,
+            task_count,
+            len(self._sessions),
+        )
