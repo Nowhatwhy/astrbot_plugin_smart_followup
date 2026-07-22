@@ -61,7 +61,7 @@ git clone https://github.com/Nowhatwhy/astrbot_plugin_smart_followup.git
 
 插件的运行日志统一以 `[smart_followup]` 开头，覆盖以下完整链路：
 
-当前调试版本默认启用 `debug_full_payload`，会额外打印完整 system prompt、用户 prompt、额外用户内容、会话上下文、模型正文、思考内容和 Provider 原始响应。日志包含敏感聊天数据，请仅在本地排查时开启，问题定位后立即关闭。
+当前调试版本默认启用 `debug_full_payload`，会额外打印完整 system prompt、本轮用户 prompt、续聊插件自己的临时提示、模型正文和思考内容。历史对话、其他插件召回内容、消息链及 Provider 原始对象只记录数量或不记录。日志仍可能包含敏感数据，请仅在本地排查时开启，问题定位后立即关闭。
 
 1. 插件加载和持久化任务恢复
 2. 收到用户消息并取消旧定时任务
