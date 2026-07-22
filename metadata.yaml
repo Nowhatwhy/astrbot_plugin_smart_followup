@@ -1,8 +1,8 @@
 name: astrbot_plugin_smart_followup
 display_name: 智能续聊
 short_desc: 让 Agent 理解沉默，并在合适的时间主动续上话题。
-desc: 基于当前对话语义和用户活跃度安排未来评估，到点后通过普通消息管线重新运行 Agent，并保持长上下文缓存前缀。
-version: v0.3.0
+desc: 让 Agent 默认持续选择下一次主动联系时间，到点后通过普通消息管线生成、直接发送并继续调度，同时保持长上下文缓存前缀。
+version: v0.4.0
 author: Nowhatwhy
 repo: https://github.com/Nowhatwhy/astrbot_plugin_smart_followup
 astrbot_version: ">=4.26,<5"

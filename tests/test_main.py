@@ -13,6 +13,8 @@ from data.plugins.astrbot_plugin_smart_followup.main import (
     EVENT_DECISION_KEY,
     SmartFollowupPlugin,
     WAKE_EVENT_KEY,
+    WAKE_PROMPT_KEY,
+    WAKE_TRIGGER,
 )
 
 
@@ -45,12 +47,21 @@ class SmartFollowupDecisionTest(unittest.TestCase):
         self.assertEqual(clean_text, "回复")
         self.assertIsNone(decision)
 
-    def test_no_marker_means_no_schedule(self) -> None:
-        """没有控制标记时自然表示本轮不安排任务。"""
+    def test_no_marker_has_no_explicit_parser_decision(self) -> None:
+        """没有控制标记时由运行时采用最长等待兜底。"""
         clean_text, decision = self.plugin._extract_decision("普通回复")
 
         self.assertEqual(clean_text, "普通回复")
         self.assertIsNone(decision)
+
+    def test_extracts_explicit_never_decision(self) -> None:
+        """只有 NEVER 才明确表示永久停止主动联系。"""
+        clean_text, decision = self.plugin._extract_decision(
+            "好的<<SMART_FOLLOWUP|NEVER>>"
+        )
+
+        self.assertEqual(clean_text, "好的")
+        self.assertEqual(decision, {"never": 1})
 
     def test_rejects_legacy_json_block(self) -> None:
         """旧版 XML 与 JSON 控制块不得再生成调度决策。"""
@@ -156,6 +167,10 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("<<SMART_FOLLOWUP|等待秒数>>", request.system_prompt)
         self.assertIn("30 到 3600", request.system_prompt)
+        self.assertIn("旧任务就会自动取消", request.system_prompt)
+        self.assertIn("下一次主动联系时间是“永远”", request.system_prompt)
+        self.assertIn("普通同学可能很久后重新寒暄", request.system_prompt)
+        self.assertIn("<<SMART_FOLLOWUP|NEVER>>", request.system_prompt)
         self.assertNotIn("12s, 18s", request.system_prompt)
         self.assertEqual(len(request.extra_user_content_parts), 1)
         self.assertIn("12s, 18s", request.extra_user_content_parts[0].text)
@@ -196,13 +211,16 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         wake_event = SimpleNamespace(
             unified_msg_origin="umo",
             is_private_chat=lambda: True,
-            get_extra=lambda key: 4 if key == WAKE_EVENT_KEY else None,
+            get_extra=lambda key: {
+                WAKE_EVENT_KEY: 4,
+                WAKE_PROMPT_KEY: DEFAULT_WAKE_PROMPT,
+            }.get(key),
             stop_event=lambda: None,
         )
         normal_request = ProviderRequest(system_prompt="persona", prompt="用户消息")
         wake_request = ProviderRequest(
             system_prompt="persona",
-            prompt=DEFAULT_WAKE_PROMPT,
+            prompt=WAKE_TRIGGER,
             contexts=[{"role": "assistant", "content": "上一条回复"}],
         )
 
@@ -217,6 +235,8 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
             DEFAULT_WAKE_PROMPT,
             [part["text"] for part in wake_request.contexts[-1]["content"]],
         )
+        self.assertIn("不要再次判断是否值得发送", DEFAULT_WAKE_PROMPT)
+        self.assertIn("生成一条非空", DEFAULT_WAKE_PROMPT)
 
     async def test_schedule_creates_persistent_local_wait(self) -> None:
         """回复发送后应持久化时间并创建一次本地等待任务。"""
@@ -282,7 +302,11 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         wake_event = queued_events[0]
         self.assertEqual(wake_event.unified_msg_origin, umo)
         self.assertEqual(wake_event.platform_meta, metadata)
+        self.assertEqual(wake_event.message_str, WAKE_TRIGGER)
         self.assertEqual(wake_event.get_extra(WAKE_EVENT_KEY), 6)
+        self.assertEqual(
+            wake_event.get_extra(WAKE_PROMPT_KEY), DEFAULT_WAKE_PROMPT
+        )
         self.assertFalse(wake_event.get_extra("enable_streaming"))
 
     async def test_schedule_can_be_recovered_from_reasoning_content(self) -> None:
@@ -311,8 +335,13 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(extras[EVENT_DECISION_KEY]["revision"], 3)
         self.assertEqual(extras[EVENT_DECISION_KEY]["after_seconds"], 45)
 
-    async def test_wake_skip_marker_suppresses_message(self) -> None:
-        """唤醒评估的跳过标记不应发送给用户。"""
+    async def test_wake_keeps_reply_and_schedules_next_contact(self) -> None:
+        """到点后的正文应直接发送，并继续安排下一次主动联系。"""
+        self.plugin._sessions["umo"] = {
+            "revision": 2,
+            "daily_date": "",
+            "daily_count": 0,
+        }
         extras = {WAKE_EVENT_KEY: 2}
         event = SimpleNamespace(
             unified_msg_origin="umo",
@@ -322,13 +351,60 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         response = LLMResponse(
             role="assistant",
-            completion_text="<<SMART_FOLLOWUP_SKIP>>",
+            completion_text="到点啦，你刚才想说什么？<<SMART_FOLLOWUP|30>>",
         )
 
         await self.plugin.parse_followup_decision(event, response)
 
-        self.assertEqual(response.completion_text, "")
-        self.assertIsNone(extras[EVENT_DECISION_KEY])
+        self.assertEqual(response.completion_text, "到点啦，你刚才想说什么？")
+        self.assertEqual(extras[EVENT_DECISION_KEY]["revision"], 2)
+        self.assertEqual(extras[EVENT_DECISION_KEY]["after_seconds"], 30)
+
+    async def test_missing_marker_uses_maximum_delay_instead_of_forever(self) -> None:
+        """模型漏掉必需标记时应使用最长等待，而不是永久停止。"""
+        self.plugin._sessions["umo"] = {
+            "revision": 5,
+            "daily_date": "",
+            "daily_count": 0,
+        }
+        extras = {}
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            is_private_chat=lambda: True,
+            get_extra=lambda key: extras.get(key),
+            set_extra=extras.__setitem__,
+        )
+        response = LLMResponse(role="assistant", completion_text="普通回复")
+
+        await self.plugin.parse_followup_decision(event, response)
+
+        self.assertEqual(extras[EVENT_DECISION_KEY]["revision"], 5)
+        self.assertEqual(extras[EVENT_DECISION_KEY]["after_seconds"], 3600)
+
+    async def test_daily_limit_defers_instead_of_stopping_chain(self) -> None:
+        """达到每日上限后应推迟到次日，而不是永久停止主动联系。"""
+        today = datetime.now().astimezone().date().isoformat()
+        self.plugin._sessions["umo"] = {
+            "revision": 6,
+            "daily_date": today,
+            "daily_count": 3,
+        }
+        extras = {}
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            is_private_chat=lambda: True,
+            get_extra=lambda key: extras.get(key),
+            set_extra=extras.__setitem__,
+        )
+        response = LLMResponse(
+            role="assistant",
+            completion_text="稍后再聊<<SMART_FOLLOWUP|30>>",
+        )
+
+        await self.plugin.parse_followup_decision(event, response)
+
+        self.assertEqual(response.completion_text, "稍后再聊")
+        self.assertGreater(extras[EVENT_DECISION_KEY]["after_seconds"], 30)
 
 
 if __name__ == "__main__":

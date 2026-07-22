@@ -1,8 +1,10 @@
 import asyncio
 import hashlib
+import json
 import re
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
@@ -20,45 +22,23 @@ CONTROL_TAG_END = ">>"
 STATE_KEY = "session_state_v2"
 EVENT_DECISION_KEY = "smart_followup_decision"
 WAKE_EVENT_KEY = "smart_followup_wake_revision"
-WAKE_SKIP_TAG = "<<SMART_FOLLOWUP_SKIP>>"
+WAKE_PROMPT_KEY = "smart_followup_wake_prompt"
+WAKE_TRIGGER = "<<SMART_FOLLOWUP_WAKE>>"
 LOG_PREFIX = "[smart_followup]"
 
-DEFAULT_DECISION_PROMPT = """
-你可以为当前私聊安排一次未来的主动续聊评估。
-
-只有在对话存在明确悬念、未完成事项、用户承诺稍后继续，或根据语境有自然的再次联系理由时，才在正常回复的最末尾追加：
-<<SMART_FOLLOWUP|等待秒数>>
-
-示例：
-- 用户说“我马上告诉你一件事”后突然沉默：可安排几十秒到几分钟后重新评估。
-- 用户说“我去上班了”：如确有必要，可根据上下文安排到午休或下班后；普通道别通常不安排。
-- 用户明确要求稍后提醒或联系：按用户给出的时间安排。
-- 用户要求不要打扰：绝不安排。
-
-规则：
-1. 等待秒数必须是 {{min_delay_seconds}} 到 {{max_delay_seconds}} 之间的整数。
-2. 标记只代表“到点后重新运行主动 Agent 进行评估”，现在不要提前撰写未来消息。
-3. 不需要续聊时不要输出任何标记，也不要输出 NONE。
-4. 标记只能出现一次，必须位于整条回复最末尾，不能放进代码块，也不要向用户解释。
-""".strip()
-
-LEGACY_WAKE_PROMPT = (
-    "重新查看该会话的最近对话和用户状态，判断现在是否适合主动联系用户。"
-    "如果适合，请结合当前人格自然生成一条消息，并使用 send_message_to_user 工具发送；"
-    "如果已经不合时宜或没有足够理由，则不要发送。"
-)
-
-DEFAULT_WAKE_PROMPT = (
-    "这是一轮内部主动续聊评估，不是用户刚刚发送的新消息。"
-    "请重新查看最近对话和用户状态，判断现在是否适合主动联系用户。"
-    "如果适合，直接输出一条符合当前人格、可以发送给用户的自然消息；"
-    f"如果已经不合时宜或没有足够理由，只输出 {WAKE_SKIP_TAG}。"
-    "不要提及定时任务、内部指令或本次评估。"
-)
+# 配置 schema 是管理员可见默认值的唯一来源，避免 Python 与 JSON 各维护一份。
+with (
+    Path(__file__).with_name("_conf_schema.json").open(encoding="utf-8") as schema_file
+):
+    _CONFIG_SCHEMA = json.load(schema_file)
+DEFAULT_MAX_DELAY_SECONDS = int(_CONFIG_SCHEMA["max_delay_seconds"]["default"])
+DEFAULT_DECISION_PROMPT = str(_CONFIG_SCHEMA["decision_prompt"]["default"]).strip()
+DEFAULT_WAKE_PROMPT = str(_CONFIG_SCHEMA["wake_prompt"]["default"]).strip()
+del _CONFIG_SCHEMA
 
 
 class SmartFollowupPlugin(Star):
-    """在用户沉默后安排 AstrBot 主动 Agent 重新评估会话。"""
+    """在用户沉默后安排 AstrBot Agent 延迟主动回复。"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         """初始化插件状态。
@@ -129,12 +109,14 @@ class SmartFollowupPlugin(Star):
                 state_changed = True
                 continue
 
+            wake_prompt = str(pending.get("wake_prompt") or DEFAULT_WAKE_PROMPT).strip()
+
             self._tasks[umo] = asyncio.create_task(
                 self._wake_after(
                     umo=umo,
                     revision=revision,
                     run_at=run_at,
-                    wake_prompt=str(pending.get("wake_prompt") or DEFAULT_WAKE_PROMPT),
+                    wake_prompt=wake_prompt,
                     self_id=str(pending.get("self_id") or "astrbot"),
                 )
             )
@@ -151,7 +133,9 @@ class SmartFollowupPlugin(Star):
             self.config.get("enabled", True),
             self.config.get("private_only", True),
             max(1, int(self.config.get("min_delay_seconds", 30))),
-            max(1, int(self.config.get("max_delay_seconds", 86400))),
+            max(
+                1, int(self.config.get("max_delay_seconds", DEFAULT_MAX_DELAY_SECONDS))
+            ),
             max(0, int(self.config.get("daily_limit", 3))),
             pending_tasks,
         )
@@ -187,7 +171,7 @@ class SmartFollowupPlugin(Star):
         wake_prompt: str,
         self_id: str,
     ) -> None:
-        """等待到期后向普通消息管线投递一次临时评估事件。
+        """等待到期后向普通消息管线投递一次主动回复事件。
 
         Args:
             umo: 原会话的统一消息来源。
@@ -217,7 +201,7 @@ class SmartFollowupPlugin(Star):
             wake_event = CronMessageEvent(
                 context=self.context,
                 session=session,
-                message=wake_prompt,
+                message=WAKE_TRIGGER,
                 sender_id=self_id,
                 sender_name="Smart Follow-up",
                 message_type=session.message_type,
@@ -227,6 +211,7 @@ class SmartFollowupPlugin(Star):
                 # 保持平台能力和工具集合与普通对话一致，避免请求结构发生变化。
                 wake_event.platform_meta = platform.meta()
             wake_event.set_extra(WAKE_EVENT_KEY, revision)
+            wake_event.set_extra(WAKE_PROMPT_KEY, wake_prompt)
             wake_event.set_extra("enable_streaming", False)
             self.context.get_event_queue().put_nowait(wake_event)
             logger.info(
@@ -292,13 +277,18 @@ class SmartFollowupPlugin(Star):
             return clean_text, None
 
         payload = compact_matches[-1].group(1).strip()
+        if payload.upper() == "NEVER":
+            return clean_text, {"never": 1}
         try:
             after_seconds = int(payload)
         except ValueError:
             logger.warning("%s Ignored malformed follow-up marker", LOG_PREFIX)
             return clean_text, None
         minimum = max(1, int(self.config.get("min_delay_seconds", 30)))
-        maximum = max(minimum, int(self.config.get("max_delay_seconds", 86400)))
+        maximum = max(
+            minimum,
+            int(self.config.get("max_delay_seconds", DEFAULT_MAX_DELAY_SECONDS)),
+        )
         return clean_text, {
             "after_seconds": min(maximum, max(minimum, int(after_seconds)))
         }
@@ -448,7 +438,10 @@ class SmartFollowupPlugin(Star):
                 return
 
         minimum = max(1, int(self.config.get("min_delay_seconds", 30)))
-        maximum = max(minimum, int(self.config.get("max_delay_seconds", 86400)))
+        maximum = max(
+            minimum,
+            int(self.config.get("max_delay_seconds", DEFAULT_MAX_DELAY_SECONDS)),
+        )
         prompt_template = str(
             self.config.get("decision_prompt", DEFAULT_DECISION_PROMPT)
             or DEFAULT_DECISION_PROMPT
@@ -492,7 +485,7 @@ class SmartFollowupPlugin(Star):
             "<smart_followup_context>\n"
             f"当前本地时间：{datetime.now().astimezone().isoformat(timespec='seconds')}\n"
             f"近期用户消息间隔（从旧到新）：{interval_text}\n"
-            f"今日已安排主动评估：{daily_count}/"
+            f"今日已安排主动回复：{daily_count}/"
             f"{max(0, int(self.config.get('daily_limit', 3)))}\n"
             "这些是私有运行数据，仅用于 system prompt 中的主动续聊决策。\n"
             "</smart_followup_context>"
@@ -500,9 +493,12 @@ class SmartFollowupPlugin(Star):
         if isinstance(wake_revision, int):
             # 唤醒指令作为历史末尾的临时 user 消息参与推理。system prompt、历史
             # 前缀和平台工具结构均与普通对话保持一致。
-            temporary_parts: list[dict[str, Any]] = []
-            if req.prompt:
-                temporary_parts.append({"type": "text", "text": req.prompt})
+            wake_prompt = str(
+                event.get_extra(WAKE_PROMPT_KEY) or DEFAULT_WAKE_PROMPT
+            ).strip()
+            temporary_parts: list[dict[str, Any]] = [
+                {"type": "text", "text": wake_prompt}
+            ]
             for part in req.extra_user_content_parts:
                 if hasattr(part, "model_dump_for_context"):
                     part_data = part.model_dump_for_context()
@@ -568,7 +564,17 @@ class SmartFollowupPlugin(Star):
             event: 当前消息事件。
             response: 当前 LLM 响应。
         """
-        if not self._is_eligible(event) or not response.completion_text:
+        if not self._is_eligible(event):
+            return
+
+        is_wake = isinstance(event.get_extra(WAKE_EVENT_KEY), int)
+        if not response.completion_text:
+            if is_wake:
+                logger.error(
+                    "%s Wake Agent unexpectedly returned an empty response: session=%s",
+                    LOG_PREFIX,
+                    event.unified_msg_origin,
+                )
             return
 
         if self.config.get("debug_full_payload", False):
@@ -584,26 +590,25 @@ class SmartFollowupPlugin(Star):
                 response.reasoning_content,
             )
 
-        if isinstance(event.get_extra(WAKE_EVENT_KEY), int):
-            clean_text, _ = self._extract_decision(response.completion_text)
-            should_skip = WAKE_SKIP_TAG in clean_text
-            response.completion_text = (
-                "" if should_skip else clean_text.replace(WAKE_SKIP_TAG, "").strip()
-            )
-            if response.reasoning_content:
-                clean_reasoning, _ = self._extract_decision(response.reasoning_content)
-                response.reasoning_content = clean_reasoning.replace(
-                    WAKE_SKIP_TAG, ""
-                ).strip()
-            event.set_extra(EVENT_DECISION_KEY, None)
-            logger.info(
-                "%s Wake evaluation completed: session=%s send=%s response_length=%s",
-                LOG_PREFIX,
-                event.unified_msg_origin,
-                not should_skip and bool(response.completion_text),
-                len(response.completion_text),
-            )
-            return
+        if is_wake:
+            wake_revision = event.get_extra(WAKE_EVENT_KEY)
+            async with self._state_lock:
+                current_revision = int(
+                    self._sessions.get(event.unified_msg_origin, {}).get("revision", -1)
+                )
+            if current_revision != wake_revision:
+                response.completion_text = ""
+                event.set_extra(EVENT_DECISION_KEY, None)
+                logger.info(
+                    "%s Wake reply suppressed because user activity advanced the "
+                    "conversation: session=%s scheduled_revision=%s "
+                    "current_revision=%s",
+                    LOG_PREFIX,
+                    event.unified_msg_origin,
+                    wake_revision,
+                    current_revision,
+                )
+                return
 
         had_control_marker = (
             CONTROL_TAG_PREFIX in response.completion_text
@@ -626,44 +631,76 @@ class SmartFollowupPlugin(Star):
                 decision = reasoning_decision
                 decision_source = "reasoning"
 
-        if not decision:
+        if decision and decision.get("never") == 1:
             event.set_extra(EVENT_DECISION_KEY, None)
             logger.info(
-                "%s No future active-agent evaluation requested: session=%s "
-                "marker_present=%s",
+                "%s Model explicitly selected NEVER for proactive contact: session=%s",
                 LOG_PREFIX,
                 event.unified_msg_origin,
-                had_control_marker,
             )
             return
 
+        if not decision:
+            decision = {
+                "after_seconds": max(
+                    max(1, int(self.config.get("min_delay_seconds", 30))),
+                    int(
+                        self.config.get("max_delay_seconds", DEFAULT_MAX_DELAY_SECONDS)
+                    ),
+                )
+            }
+            decision_source = "fallback_max_delay"
+            logger.warning(
+                "%s Model omitted the required next-contact marker; using maximum "
+                "delay instead of treating omission as forever: session=%s delay=%ss",
+                LOG_PREFIX,
+                event.unified_msg_origin,
+                decision["after_seconds"],
+            )
+
         async with self._state_lock:
             state = self._sessions.get(event.unified_msg_origin, {})
-            today = datetime.now().astimezone().date().isoformat()
+            now = datetime.now().astimezone()
+            today = now.date().isoformat()
             daily_count = (
                 int(state.get("daily_count", 0))
                 if state.get("daily_date") == today
                 else 0
             )
-            if daily_count >= max(0, int(self.config.get("daily_limit", 3))):
-                event.set_extra(EVENT_DECISION_KEY, None)
+            daily_limit = max(0, int(self.config.get("daily_limit", 3)))
+            if daily_count >= daily_limit:
+                next_day = datetime.combine(
+                    now.date() + timedelta(days=1),
+                    datetime.min.time(),
+                    tzinfo=now.tzinfo,
+                )
+                deferred_seconds = max(1, int((next_day - now).total_seconds()) + 1)
+                decision["after_seconds"] = max(
+                    decision["after_seconds"], deferred_seconds
+                )
                 logger.info(
-                    "%s Daily evaluation limit reached: session=%s count=%s",
+                    "%s Daily proactive reply limit reached; next contact deferred "
+                    "past local midnight: session=%s count=%s delay=%ss",
                     LOG_PREFIX,
                     event.unified_msg_origin,
                     daily_count,
+                    decision["after_seconds"],
                 )
-                return
-            decision["revision"] = int(state.get("revision", 0))
+            decision["revision"] = (
+                int(event.get_extra(WAKE_EVENT_KEY))
+                if is_wake
+                else int(state.get("revision", 0))
+            )
         event.set_extra(EVENT_DECISION_KEY, decision)
         logger.info(
-            "%s Future active-agent evaluation selected: session=%s "
-            "revision=%s delay=%ss source=%s",
+            "%s Future proactive reply selected: session=%s "
+            "revision=%s delay=%ss source=%s request_kind=%s",
             LOG_PREFIX,
             event.unified_msg_origin,
             decision["revision"],
             decision["after_seconds"],
             decision_source,
+            "wake" if is_wake else "normal",
         )
 
     @filter.after_message_sent(priority=100000)
@@ -688,8 +725,6 @@ class SmartFollowupPlugin(Star):
         wake_prompt = str(
             self.config.get("wake_prompt", DEFAULT_WAKE_PROMPT) or DEFAULT_WAKE_PROMPT
         ).strip()
-        if wake_prompt == LEGACY_WAKE_PROMPT:
-            wake_prompt = DEFAULT_WAKE_PROMPT
         self_id = event.get_self_id() or "astrbot"
 
         async with self._state_lock:
