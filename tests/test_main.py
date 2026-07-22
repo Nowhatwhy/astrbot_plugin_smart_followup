@@ -104,7 +104,21 @@ class SmartFollowupTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((text, seconds), ("回复", 90))
         self.assertEqual((never_text, never), ("结束", "NEVER"))
-        self.assertEqual((malformed_text, malformed), ("回复", None))
+        self.assertEqual(
+            (malformed_text, malformed),
+            ("回复<<SMART_FOLLOWUP|错误>>", None),
+        )
+
+    def test_parse_does_not_remove_text_between_malformed_and_valid_tags(
+        self,
+    ) -> None:
+        """残缺标签不能导致后续正文被一并删除。"""
+        text, seconds = self.plugin._parse_text(
+            "<<SMART_FOLLOWUP|120>\n我醒了呀\n<<SMART_FOLLOWUP|120>>"
+        )
+
+        self.assertEqual(text, "<<SMART_FOLLOWUP|120>\n我醒了呀")
+        self.assertEqual(seconds, 120)
 
     async def test_user_message_replaces_timer(self) -> None:
         """新用户消息应取消旧计时器并增加会话版本。"""

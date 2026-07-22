@@ -17,7 +17,6 @@ PROMPT_PATTERN = re.compile(
     rf"\n*{re.escape(PROMPT_START)}[\s\S]*?{re.escape(PROMPT_END)}"
 )
 VALID_TAG_PATTERN = re.compile(r"<<SMART_FOLLOWUP\|(NEVER|[1-9]\d*)>>", re.I)
-ANY_TAG_PATTERN = re.compile(r"<<SMART_FOLLOWUP\|[\s\S]*?(?:>>|$)", re.I)
 
 EVENT_REVISION = "smart_followup_revision"
 EVENT_REQUEST = "smart_followup_request"
@@ -64,7 +63,7 @@ class SmartFollowupPlugin(Star):
             清理后的文本，以及正整数秒数、`NEVER` 或 `None`。
         """
         matches = list(VALID_TAG_PATTERN.finditer(text))
-        clean_text = ANY_TAG_PATTERN.sub("", text).strip()
+        clean_text = VALID_TAG_PATTERN.sub("", text).strip()
         if not matches:
             return clean_text, None
         value = matches[-1].group(1).upper()
@@ -204,14 +203,25 @@ class SmartFollowupPlugin(Star):
                 response.completion_text = ""
             return
 
+        original_length = len(response.completion_text or "")
         decision = self._parse_response(response)
         logger.info(
-            "%s Decision parsed: session=%s revision=%s result=%s",
+            "%s Decision parsed: session=%s revision=%s result=%s reply_chars=%s->%s",
             LOG_PREFIX,
             event.unified_msg_origin,
             revision,
             "MISSING" if decision is None else decision,
+            original_length,
+            len(response.completion_text or ""),
         )
+        if decision is not None and not response.completion_text.strip():
+            logger.warning(
+                "%s Model returned a control tag without a reply body: "
+                "session=%s revision=%s",
+                LOG_PREFIX,
+                event.unified_msg_origin,
+                revision,
+            )
         if decision == "NEVER":
             event.set_extra(EVENT_REQUEST, None)
             event.set_extra(EVENT_DECISION, None)
@@ -285,13 +295,16 @@ class SmartFollowupPlugin(Star):
                     revision,
                 )
                 return
+            retry_original_length = len(retry_response.completion_text or "")
             value = self._parse_response(retry_response)
             logger.info(
-                "%s Retry parsed: session=%s revision=%s result=%s",
+                "%s Retry parsed: session=%s revision=%s result=%s chars=%s->%s",
                 LOG_PREFIX,
                 umo,
                 revision,
                 "MISSING" if value is None else value,
+                retry_original_length,
+                len(retry_response.completion_text or ""),
             )
 
         if not isinstance(value, int) or self._revisions.get(umo) != revision:
