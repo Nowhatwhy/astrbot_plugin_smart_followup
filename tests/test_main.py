@@ -75,12 +75,8 @@ class SmartFollowupDecisionTest(unittest.TestCase):
 
     def test_delay_is_clamped_to_configured_bounds(self) -> None:
         """越界等待时间应由插件确定性限制。"""
-        _, short_decision = self.plugin._extract_decision(
-            "<<SMART_FOLLOWUP|1>>"
-        )
-        _, long_decision = self.plugin._extract_decision(
-            "<<SMART_FOLLOWUP|99999>>"
-        )
+        _, short_decision = self.plugin._extract_decision("<<SMART_FOLLOWUP|1>>")
+        _, long_decision = self.plugin._extract_decision("<<SMART_FOLLOWUP|99999>>")
 
         self.assertEqual(short_decision["after_seconds"], 30)
         self.assertEqual(long_decision["after_seconds"], 3600)
@@ -243,8 +239,36 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("3600", request.system_prompt)
         self.assertEqual(len(request.extra_user_content_parts), 1)
         self.assertIn("当前本地时间", request.extra_user_content_parts[0].text)
+        self.assertIn(
+            "本轮回复末尾必须原样追加且只追加一个调度标记",
+            request.extra_user_content_parts[0].text,
+        )
+        self.assertIn(
+            "<<SMART_FOLLOWUP|NEVER>>", request.extra_user_content_parts[0].text
+        )
         self.assertNotIn("近期用户消息间隔", request.extra_user_content_parts[0].text)
         self.assertNotIn("今日已安排主动回复", request.extra_user_content_parts[0].text)
+        self.assertTrue(request.extra_user_content_parts[0]._no_save)
+
+    async def test_user_prompt_reminder_can_be_disabled(self) -> None:
+        """关闭配置后应保留临时时间，但不再拼接格式提醒。"""
+        self.plugin.config["user_prompt_reminder_enabled"] = False
+        self.plugin._sessions["umo"] = {"revision": 1}
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            is_private_chat=lambda: True,
+            get_extra=lambda key: None,
+        )
+        request = ProviderRequest(system_prompt="persona", prompt="用户消息")
+
+        await self.plugin.inject_followup_protocol(event, request)
+
+        self.assertEqual(len(request.extra_user_content_parts), 1)
+        self.assertIn("当前本地时间", request.extra_user_content_parts[0].text)
+        self.assertNotIn(
+            "本轮回复末尾必须原样追加且只追加一个调度标记",
+            request.extra_user_content_parts[0].text,
+        )
         self.assertTrue(request.extra_user_content_parts[0]._no_save)
 
     async def test_delay_config_does_not_change_system_prompt(self) -> None:
@@ -306,6 +330,12 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
             DEFAULT_WAKE_PROMPT,
             [part["text"] for part in wake_request.contexts[-1]["content"]],
         )
+        self.assertTrue(
+            any(
+                "本轮回复末尾必须原样追加且只追加一个调度标记" in part["text"]
+                for part in wake_request.contexts[-1]["content"]
+            )
+        )
         self.assertIn("不要再次判断是否发送", DEFAULT_WAKE_PROMPT)
         self.assertIn("自然、非空的主动消息", DEFAULT_WAKE_PROMPT)
 
@@ -317,9 +347,7 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
             "daily_date": "",
             "daily_count": 0,
         }
-        extras = {
-            EVENT_DECISION_KEY: {"after_seconds": 45, "revision": 4}
-        }
+        extras = {EVENT_DECISION_KEY: {"after_seconds": 45, "revision": 4}}
         event = SimpleNamespace(
             unified_msg_origin="umo",
             is_private_chat=lambda: True,
@@ -352,9 +380,7 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
             get_platform_inst=lambda platform_id: SimpleNamespace(
                 meta=lambda: metadata
             ),
-            get_event_queue=lambda: SimpleNamespace(
-                put_nowait=queued_events.append
-            ),
+            get_event_queue=lambda: SimpleNamespace(put_nowait=queued_events.append),
         )
         self.plugin._sessions[umo] = {
             "revision": 6,
@@ -375,9 +401,7 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wake_event.platform_meta, metadata)
         self.assertEqual(wake_event.message_str, WAKE_TRIGGER)
         self.assertEqual(wake_event.get_extra(WAKE_EVENT_KEY), 6)
-        self.assertEqual(
-            wake_event.get_extra(WAKE_PROMPT_KEY), DEFAULT_WAKE_PROMPT
-        )
+        self.assertEqual(wake_event.get_extra(WAKE_PROMPT_KEY), DEFAULT_WAKE_PROMPT)
         self.assertFalse(wake_event.get_extra("enable_streaming"))
 
     async def test_schedule_can_be_recovered_from_reasoning_content(self) -> None:

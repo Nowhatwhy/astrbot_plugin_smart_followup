@@ -35,6 +35,12 @@
     "default": 3,
     "hint": "设置为 0 可完全关闭调度。达到上限后不会永久停止，而是把下一次主动回复推迟到次日。"
   },
+  "user_prompt_reminder_enabled": {
+    "description": "在用户提示词末尾提醒输出调度标记",
+    "type": "bool",
+    "default": true,
+    "hint": "作为不保存的临时内容拼接到本轮用户提示词末尾，提高长上下文下的标记遵循率；不会修改 system prompt 或历史消息。"
+  },
   "decision_prompt": {
     "description": "主动续聊决策提示词",
     "type": "text",

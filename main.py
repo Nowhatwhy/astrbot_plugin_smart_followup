@@ -24,6 +24,11 @@ WAKE_EVENT_KEY = "smart_followup_wake_revision"
 WAKE_PROMPT_KEY = "smart_followup_wake_prompt"
 WAKE_TRIGGER = "<<SMART_FOLLOWUP_WAKE>>"
 LOG_PREFIX = "[smart_followup]"
+USER_PROMPT_REMINDER = (
+    "本轮回复末尾必须原样追加且只追加一个调度标记，不得省略。"
+    "正常格式示例：<<SMART_FOLLOWUP|60>>，将 60 替换为等待秒数；"
+    "仅永久停止联系时使用 <<SMART_FOLLOWUP|NEVER>>。"
+)
 
 # 配置 schema 是管理员可见默认值的唯一来源，避免 Python 与 JSON 各维护一份。
 with (
@@ -407,11 +412,14 @@ class SmartFollowupPlugin(Star):
             f"{stable_prompt}\n{PROMPT_MARKER_END}"
         ).strip()
 
-        dynamic_context = (
-            "<smart_followup_context>\n"
-            f"当前本地时间：{datetime.now().astimezone().isoformat(timespec='seconds')}\n"
-            "</smart_followup_context>"
-        )
+        dynamic_context_lines = [
+            "<smart_followup_context>",
+            f"当前本地时间：{datetime.now().astimezone().isoformat(timespec='seconds')}",
+        ]
+        if self.config.get("user_prompt_reminder_enabled", True):
+            dynamic_context_lines.append(USER_PROMPT_REMINDER)
+        dynamic_context_lines.append("</smart_followup_context>")
+        dynamic_context = "\n".join(dynamic_context_lines)
         if isinstance(wake_revision, int):
             # 唤醒指令作为历史末尾的临时 user 消息参与推理。system prompt、历史
             # 前缀和平台工具结构均与普通对话保持一致。
