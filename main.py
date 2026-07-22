@@ -437,18 +437,10 @@ class SmartFollowupPlugin(Star):
                 )
                 return
 
-        minimum = max(1, int(self.config.get("min_delay_seconds", 30)))
-        maximum = max(
-            minimum,
-            int(self.config.get("max_delay_seconds", DEFAULT_MAX_DELAY_SECONDS)),
-        )
-        prompt_template = str(
+        stable_prompt = str(
             self.config.get("decision_prompt", DEFAULT_DECISION_PROMPT)
             or DEFAULT_DECISION_PROMPT
         ).strip()
-        stable_prompt = prompt_template.replace(
-            "{{min_delay_seconds}}", str(minimum)
-        ).replace("{{max_delay_seconds}}", str(maximum))
         marker_pattern = re.compile(
             rf"\n*{re.escape(PROMPT_MARKER_START)}[\s\S]*?{re.escape(PROMPT_MARKER_END)}"
         )

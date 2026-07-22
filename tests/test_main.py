@@ -165,35 +165,36 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         await self.plugin.inject_followup_protocol(event, request)
 
-        self.assertIn("<<SMART_FOLLOWUP|等待秒数>>", request.system_prompt)
-        self.assertIn("30 到 3600", request.system_prompt)
-        self.assertIn("旧任务就会自动取消", request.system_prompt)
-        self.assertIn("下一次主动联系时间是“永远”", request.system_prompt)
-        self.assertIn("普通同学可能很久后重新寒暄", request.system_prompt)
+        self.assertIn("<<SMART_FOLLOWUP|秒数>>", request.system_prompt)
+        self.assertIn("主动联系是默认行为", request.system_prompt)
+        self.assertIn("旧安排会自动取消", request.system_prompt)
         self.assertIn("<<SMART_FOLLOWUP|NEVER>>", request.system_prompt)
+        self.assertNotIn("30", request.system_prompt)
+        self.assertNotIn("3600", request.system_prompt)
         self.assertNotIn("12s, 18s", request.system_prompt)
         self.assertEqual(len(request.extra_user_content_parts), 1)
         self.assertIn("12s, 18s", request.extra_user_content_parts[0].text)
         self.assertTrue(request.extra_user_content_parts[0]._no_save)
 
-    async def test_configured_decision_prompt_replaces_placeholders(self) -> None:
-        """管理员自定义提示词中的时间占位符应被替换。"""
-        self.plugin.config["decision_prompt"] = (
-            "范围 {{min_delay_seconds}}-{{max_delay_seconds}}，"
-            "输出 <<SMART_FOLLOWUP|秒数>>"
-        )
+    async def test_delay_config_does_not_change_system_prompt(self) -> None:
+        """修改代码兜底范围不应改变稳定的 system prompt。"""
         self.plugin._sessions["umo"] = {"revision": 1}
         event = SimpleNamespace(
             unified_msg_origin="umo",
             is_private_chat=lambda: True,
             get_extra=lambda key: None,
         )
-        request = ProviderRequest(system_prompt="persona")
+        first_request = ProviderRequest(system_prompt="persona")
 
-        await self.plugin.inject_followup_protocol(event, request)
+        await self.plugin.inject_followup_protocol(event, first_request)
 
-        self.assertIn("范围 30-3600", request.system_prompt)
-        self.assertNotIn("{{min_delay_seconds}}", request.system_prompt)
+        self.plugin.config["min_delay_seconds"] = 5
+        self.plugin.config["max_delay_seconds"] = 10
+        second_request = ProviderRequest(system_prompt="persona")
+
+        await self.plugin.inject_followup_protocol(event, second_request)
+
+        self.assertEqual(first_request.system_prompt, second_request.system_prompt)
 
     async def test_wake_uses_same_system_prompt_and_temporary_user_tail(self) -> None:
         """唤醒请求只应在历史末尾追加不保存的临时 user 消息。"""

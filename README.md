@@ -28,12 +28,7 @@
 
 普通对话和到点唤醒使用完全相同的 system prompt。已有的 system prompt 与长对话历史仍是共同前缀，只有末尾新增的临时唤醒消息需要重新计算，从而保留提供商的前缀缓存命中。
 
-`decision_prompt` 支持以下占位符：
-
-- `{{min_delay_seconds}}`
-- `{{max_delay_seconds}}`
-
-解析器固定识别 `<<SMART_FOLLOWUP|秒数>>`，自定义提示词时应保留这一格式。
+`decision_prompt` 不包含等待时间上下限等动态配置。模型只选择自然秒数，插件代码再根据 `min_delay_seconds` 和 `max_delay_seconds` 进行限制，因此修改时间范围不会改变 system prompt。解析器固定识别 `<<SMART_FOLLOWUP|秒数>>`，自定义提示词时应保留这一格式。
 
 ## 特性
 
