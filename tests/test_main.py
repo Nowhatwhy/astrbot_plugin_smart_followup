@@ -233,6 +233,10 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("<<SMART_FOLLOWUP|秒数>>", request.system_prompt)
         self.assertIn("主动联系是默认行为", request.system_prompt)
+        self.assertIn("当前即时回复本身不能算作下一次联系", request.system_prompt)
+        self.assertIn("必须按其要求安排", request.system_prompt)
+        self.assertIn("<<SMART_FOLLOWUP|60>>", request.system_prompt)
+        self.assertIn("必须出现在模型原始输出中", request.system_prompt)
         self.assertIn("旧安排会自动取消", request.system_prompt)
         self.assertIn("<<SMART_FOLLOWUP|NEVER>>", request.system_prompt)
         self.assertNotIn("30", request.system_prompt)
