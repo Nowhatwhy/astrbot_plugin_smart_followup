@@ -21,7 +21,7 @@
 ## 提示词放置
 
 - 稳定的决策规则放在 system prompt 末尾，可通过 `decision_prompt` 配置。
-- 当前本地时间和一条简短的格式提醒通过临时 `extra_user_content_parts` 放在本轮用户输入之后。格式提醒可通过 `user_prompt_reminder_enabled` 关闭。
+- 当前本地时间和一条简短的格式提醒通过临时 `extra_user_content_parts` 放在本轮用户输入之后。格式提醒可通过 `user_prompt_reminder_enabled` 关闭，内容可通过 `user_prompt_reminder` 修改。
 - 动态内容使用 `mark_as_temp()`，不会写入会话历史。
 - 到点时消息总线只接收短标记 `<<SMART_FOLLOWUP_WAKE>>`；完整 `wake_prompt` 到最终 LLM 请求阶段才作为历史末尾的临时 user 消息加入，不修改 system prompt，也不会保存到历史。
 - 用户提示词末尾只提醒输出格式，不重复完整决策协议。
@@ -67,6 +67,7 @@ git clone https://github.com/Nowhatwhy/astrbot_plugin_smart_followup.git
 | `max_delay_seconds` | `31536000` | 最长等待秒数，默认一年 |
 | `daily_limit` | `3` | 每个会话每日主动回复上限 |
 | `user_prompt_reminder_enabled` | `true` | 在本轮用户提示词末尾临时追加调度标记格式提醒，不写入历史 |
+| `user_prompt_reminder` | 内置模板 | 拼接到本轮用户提示词末尾的临时格式提醒内容 |
 | `decision_prompt` | 内置模板 | 当前轮的时间决策规则，注入 system prompt |
 | `wake_prompt` | 内置模板 | 时间到达后交给主动 Agent 的任务指令 |
 | `debug_full_payload` | `false` | 启用调度过程及完整请求、响应日志 |

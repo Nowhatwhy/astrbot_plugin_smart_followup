@@ -240,11 +240,14 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(request.extra_user_content_parts), 1)
         self.assertIn("当前本地时间", request.extra_user_content_parts[0].text)
         self.assertIn(
-            "本轮回复末尾必须原样追加且只追加一个调度标记",
+            "只在思考中决定时间不算完成",
             request.extra_user_content_parts[0].text,
         )
         self.assertIn(
             "<<SMART_FOLLOWUP|NEVER>>", request.extra_user_content_parts[0].text
+        )
+        self.assertIn(
+            "不得裸输出数字或 NEVER", request.extra_user_content_parts[0].text
         )
         self.assertNotIn("近期用户消息间隔", request.extra_user_content_parts[0].text)
         self.assertNotIn("今日已安排主动回复", request.extra_user_content_parts[0].text)
@@ -266,10 +269,29 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(request.extra_user_content_parts), 1)
         self.assertIn("当前本地时间", request.extra_user_content_parts[0].text)
         self.assertNotIn(
-            "本轮回复末尾必须原样追加且只追加一个调度标记",
+            "只在思考中决定时间不算完成",
             request.extra_user_content_parts[0].text,
         )
         self.assertTrue(request.extra_user_content_parts[0]._no_save)
+
+    async def test_user_prompt_reminder_content_can_be_configured(self) -> None:
+        """启用提醒时应使用管理员配置的自定义内容。"""
+        custom_reminder = "自定义提醒：最终一行输出完整的调度标记。"
+        self.plugin.config["user_prompt_reminder"] = custom_reminder
+        self.plugin._sessions["umo"] = {"revision": 1}
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            is_private_chat=lambda: True,
+            get_extra=lambda key: None,
+        )
+        request = ProviderRequest(system_prompt="persona", prompt="用户消息")
+
+        await self.plugin.inject_followup_protocol(event, request)
+
+        temporary_context = request.extra_user_content_parts[0]
+        self.assertIn(custom_reminder, temporary_context.text)
+        self.assertNotIn("只在思考中决定时间不算完成", temporary_context.text)
+        self.assertTrue(temporary_context._no_save)
 
     async def test_delay_config_does_not_change_system_prompt(self) -> None:
         """修改代码兜底范围不应改变稳定的 system prompt。"""
@@ -332,7 +354,7 @@ class SmartFollowupRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(
             any(
-                "本轮回复末尾必须原样追加且只追加一个调度标记" in part["text"]
+                "只在思考中决定时间不算完成" in part["text"]
                 for part in wake_request.contexts[-1]["content"]
             )
         )
